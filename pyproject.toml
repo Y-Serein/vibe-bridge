@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibe-bridge"
+version = "0.0.1"
+description = "Multi-window session bridge between CLI tools (Codex/Claude/OpenCode) and HID screens."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+vibe-bridge = "vibe_bridge.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

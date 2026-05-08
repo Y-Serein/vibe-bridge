@@ -1,0 +1,7 @@
+name: terminal_demo
+version: 0.1.0
+entry: main.py
+requires_session: true
+transport: hid
+render: vt100
+description: Hello-world plugin: requests a session and prints VT100 to it.

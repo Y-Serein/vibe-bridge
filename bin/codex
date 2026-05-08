@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""vibe-bridge wrapper for the `codex` CLI.
+
+Place this directory first on $PATH so `codex` resolves here instead of the
+real binary. We acquire a session id, inject VIBE_SESSION_ID, and exec the real
+codex.
+"""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+from vibe_bridge.wrapper import run  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(run("codex", self_paths=[os.path.realpath(__file__)]))
