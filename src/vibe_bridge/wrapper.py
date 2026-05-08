@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .bootstrap import can_connect, ensure_daemon_running
 from .forwarder import Forwarder
@@ -115,17 +115,22 @@ def run(
         )
         return 127
 
-    session_id = _acquire_session(plugin_name, sock_path)
+    new_argv = [os.path.basename(real)] + argv[1:]
+    mode = _select_mode()
+    session_id: Optional[int] = None
+    plugin: Optional[PluginClient] = None
+    if mode == "pty":
+        plugin, session_id = _open_session_client(plugin_name, sock_path)
 
     env = dict(os.environ)
     env[ENV_SOCK_PATH] = sock_path
     if session_id is not None:
         env[ENV_SESSION_ID] = str(session_id)
 
-    new_argv = [os.path.basename(real)] + argv[1:]
-    mode = _select_mode()
-    if mode == "pty" and session_id is not None:
-        return _run_pty(real, new_argv, env, sock_path, plugin_name, session_id)
+    if mode == "pty" and session_id is not None and plugin is not None:
+        return _run_pty(real, new_argv, env, plugin)
+    if plugin is not None:
+        plugin.close()
     return _run_exec(real, new_argv, env)
 
 
@@ -142,24 +147,11 @@ def _run_pty(
     real: str,
     new_argv: List[str],
     env: dict,
-    sock_path: str,
-    plugin_name: str,
-    session_id: int,
+    plugin: PluginClient,
 ) -> int:
     """Run real CLI under a PTY; tee output to the daemon as CMD_VT100_STREAM."""
     # Imports are local so exec mode stays free of the PTY dependency chain.
     from .pty_runner import run_with_pty
-
-    # The wrapper-as-parent owns its own PluginClient. We DO NOT call
-    # ``acquire_session`` again — we adopt the sid we already have so all
-    # forwarded VT100 lands in the right window.
-    plugin = PluginClient(plugin_name=plugin_name, sock_path=sock_path)
-    plugin.adopt_session(session_id)
-    try:
-        plugin.connect()
-    except OSError:
-        # Daemon went away between handshake and adoption; fall back to exec.
-        return _run_exec(real, new_argv, env)
 
     forwarder = Forwarder(plugin.send_vt100)
     forwarder.start()
@@ -175,29 +167,41 @@ def _run_pty(
         plugin.close()
 
 
-def _acquire_session(plugin_name: str, sock_path: str) -> Optional[int]:
+def _open_session_client(
+    plugin_name: str, sock_path: str
+) -> Tuple[Optional[PluginClient], Optional[int]]:
     if not ensure_daemon_running(sock_path, timeout=3.0):
         print(
             "vibe-bridge wrapper: daemon unreachable, running without session",
             file=sys.stderr,
         )
-        return None
+        return None, None
 
     existing = _existing_session_from_env()
     if existing is not None:
-        return existing
+        try:
+            plugin = PluginClient(plugin_name=plugin_name, sock_path=sock_path)
+            plugin.adopt_session(existing)
+            plugin.connect()
+            return plugin, existing
+        except OSError:
+            return None, None
 
+    plugin: Optional[PluginClient] = None
     try:
-        with PluginClient(plugin_name=plugin_name, sock_path=sock_path) as p:
-            sid = p.acquire_session(timeout=2.0)
-            return sid
+        plugin = PluginClient(plugin_name=plugin_name, sock_path=sock_path)
+        plugin.connect()
+        sid = plugin.acquire_session(timeout=2.0)
+        return plugin, sid
     except (PluginError, OSError) as exc:
+        if plugin is not None:
+            plugin.close()
         print(
             f"vibe-bridge wrapper: session handshake failed ({exc}); "
             "running without session",
             file=sys.stderr,
         )
-        return None
+        return None, None
 
 
 def _exec_real(plugin_name: str, argv: List[str], self_paths: List[str]) -> int:

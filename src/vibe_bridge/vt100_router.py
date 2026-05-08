@@ -56,6 +56,7 @@ class Vt100Router:
         replacement: Optional[int] = None
         replay: Optional[bytes] = None
         sink: Optional[ScreenSink] = None
+        target_sid: int = sid
         with self._lock:
             self._buffers.pop(sid, None)
             self._sizes.pop(sid, None)
@@ -70,9 +71,10 @@ class Vt100Router:
                         buf = self._buffers.get(replacement)
                         body = b"".join(buf) if buf else b""
                         replay = SCREEN_CLEAR + body
+                        target_sid = replacement
         if sink is not None and replay is not None:
             try:
-                sink(replacement if replacement is not None else 0, replay)
+                sink(target_sid, replay)
             except Exception:
                 pass
 

@@ -100,6 +100,33 @@ class MockHidTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_disconnect_callback_runs_when_client_closes(self):
+        sock_path = _tmp_sock()
+        disconnected = []
+        cond = threading.Condition()
+
+        def on_disconnect(client: ClientHandle) -> None:
+            with cond:
+                disconnected.append(client.client_id)
+                cond.notify_all()
+
+        server = MockHidServer(
+            lambda pkt, c: None,
+            sock_path=sock_path,
+            on_disconnect=on_disconnect,
+        )
+        server.start()
+        try:
+            c = MockHidClient(sock_path)
+            c.close()
+            with cond:
+                deadline = time.time() + 1.0
+                while not disconnected and time.time() < deadline:
+                    cond.wait(timeout=deadline - time.time())
+            self.assertTrue(disconnected)
+        finally:
+            server.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,7 +64,7 @@ class Vt100RouterTests(unittest.TestCase):
         self.calls.clear()
         self.router.unregister(1)
         self.assertIsNone(self.router.active())
-        self.assertEqual(self.calls, [(0, SCREEN_CLEAR)])
+        self.assertEqual(self.calls, [(1, SCREEN_CLEAR)])
 
     def test_set_active_to_none_clears_when_active_was_set(self):
         self.router.register(1)

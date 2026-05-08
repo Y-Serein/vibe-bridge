@@ -111,6 +111,7 @@ class ClientHandle:
 
 
 PacketHandler = Callable[[Packet, ClientHandle], None]
+DisconnectHandler = Callable[[ClientHandle], None]
 
 
 class MockHidServer:
@@ -127,10 +128,12 @@ class MockHidServer:
         *,
         sock_path: str = DEFAULT_SOCK_PATH,
         backlog: int = 16,
+        on_disconnect: Optional[DisconnectHandler] = None,
     ) -> None:
         self._handler = handler
         self._sock_path = sock_path
         self._backlog = backlog
+        self._on_disconnect = on_disconnect
         self._sock: Optional[socket.socket] = None
         self._accept_thread: Optional[threading.Thread] = None
         self._client_threads: List[threading.Thread] = []
@@ -233,4 +236,9 @@ class MockHidServer:
             with self._lock:
                 if handle in self._clients:
                     self._clients.remove(handle)
+            if not self._stop.is_set() and self._on_disconnect is not None:
+                try:
+                    self._on_disconnect(handle)
+                except Exception:
+                    pass
             handle.close()

@@ -191,6 +191,31 @@ class WindowSwitchIntegrationTests(unittest.TestCase):
         finally:
             c.close()
 
+    def test_active_session_disconnect_releases_and_replays_next_window(self) -> None:
+        c1 = MockHidClient(self.sock_path)
+        c2 = MockHidClient(self.sock_path)
+        try:
+            sid1 = _acquire_session(c1, b"plugin-A")
+            sid2 = _acquire_session(c2, b"plugin-B")
+            self.assertEqual(self.daemon.router.active(), sid1)
+
+            c1.send_packet(make_vt100_chunk(sid1, b"AAA"))
+            self._wait_for_sink(1)
+            c2.send_packet(make_vt100_chunk(sid2, b"BBB"))
+            time.sleep(0.05)
+
+            c1.close()
+            ok = _wait_until(
+                lambda: self.daemon.sessions.get(sid1) is None
+                and self.daemon.router.active() == sid2
+            )
+            self.assertTrue(ok)
+            self._wait_for_sink(2)
+            with self._sink_lock:
+                self.assertEqual(self.sink_calls[-1], (sid2, SCREEN_CLEAR + b"BBB"))
+        finally:
+            c2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

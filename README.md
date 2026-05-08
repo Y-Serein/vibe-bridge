@@ -92,7 +92,7 @@ vibe-bridge window-activate --sid N             # activate a specific session
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-55 tests, no external dependencies.
+57 tests, no external dependencies.
 
 ---
 
@@ -112,7 +112,9 @@ The wrapper:
 2. Calls `ensure_daemon_running` — spawns a detached daemon if the socket isn't
    there, auto-detecting the Vibe HID device (`VID:PID 359f:2120`) when present.
 3. Acquires a fresh session id for each top-level wrapper run.
-4. Exports `VIBE_SESSION_ID` and `VIBE_SOCK_PATH`, then `execvp`s the real CLI.
+4. Exports `VIBE_SESSION_ID` and `VIBE_SOCK_PATH`; in an interactive TTY it
+   runs the real CLI under a PTY and forwards VT100 output to the active window,
+   while non-TTY invocations fall through to `execvp`.
 
 Set `VIBE_BRIDGE_DISABLE=1` to bypass the bridge entirely (still execs the real
 binary).
@@ -121,6 +123,8 @@ binary).
 available as overrides, but they are not needed for the normal `codex` path.
 Set `VIBE_BRIDGE_REUSE_SESSION=1` only when an intentionally nested CLI should
 reuse `$VIBE_SESSION_ID`; otherwise every `codex` run gets a new window.
+When an interactive wrapper exits, the daemon releases that sid; if it was the
+active window, the screen switches to another live window and replays its buffer.
 
 ## Status
 

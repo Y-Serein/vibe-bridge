@@ -63,7 +63,11 @@ class Daemon:
             ttl_seconds=self.config.ttl_seconds,
         )
         self.router = Vt100Router(screen_sink=self._on_screen_write)
-        self.server = MockHidServer(self._handle_packet, sock_path=self.config.sock_path)
+        self.server = MockHidServer(
+            self._handle_packet,
+            sock_path=self.config.sock_path,
+            on_disconnect=self._handle_client_disconnect,
+        )
 
         # Map sid -> ClientHandle for invalidation notifications and replies.
         self._owners: Dict[int, ClientHandle] = {}
@@ -516,6 +520,17 @@ class Daemon:
                 pass
         log.info("session %d invalidated (%s)", sid, status.name)
         self._dump_state()
+
+    def _handle_client_disconnect(self, client: ClientHandle) -> None:
+        released = []
+        with self._owners_lock:
+            for sid, owner in list(self._owners.items()):
+                if owner is client:
+                    released.append(sid)
+        for sid in released:
+            self.sessions.invalidate(sid, Status.EXPIRED)
+        if released:
+            log.info("client disconnected, released session(s): %s", released)
 
     def _on_screen_write(self, sid: int, data: bytes) -> None:
         path = self.config.screen_path
