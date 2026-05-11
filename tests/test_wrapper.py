@@ -69,13 +69,16 @@ class WrapperTests(unittest.TestCase):
 
     def test_lcd_output_adapter_replaces_tui_symbols(self):
         adapter = LcdOutputAdapter()
-        self.assertEqual(adapter.feed("⏺ Claude ╭─╮ ✓\n".encode()), b"* Claude +-+ v\n")
+        self.assertEqual(
+            adapter.feed("⏺ Claude ╭─╮ ✓ ❯\n".encode()),
+            "· Claude +-+ v >\n".encode(),
+        )
 
     def test_lcd_output_adapter_handles_split_utf8(self):
         adapter = LcdOutputAdapter()
         data = "前⏺后".encode()
         self.assertEqual(adapter.feed(data[:4]), "前".encode())
-        self.assertEqual(adapter.feed(data[4:]), "*后".encode())
+        self.assertEqual(adapter.feed(data[4:]), "·后".encode())
 
 
 if __name__ == "__main__":
