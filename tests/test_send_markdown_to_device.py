@@ -16,21 +16,42 @@ class SendMarkdownToDeviceTests(unittest.TestCase):
 
         out = send_markdown.render_text_chunk(data, lambda target: b"")
 
-        self.assertEqual(out, b"Kind   Result\ntable  text\n")
+        self.assertEqual(
+            out,
+            b"+-------+--------+\n"
+            b"| Kind  | Result |\n"
+            b"+-------+--------+\n"
+            b"| table | text   |\n"
+            b"+-------+--------+\n",
+        )
 
-    def test_pipe_table_inside_code_fence_is_left_alone(self):
+    def test_code_fence_is_rendered_as_small_screen_text(self):
         data = b"```md\n| Kind | Result |\n| --- | --- |\n```\n"
 
         out = send_markdown.render_text_chunk(data, lambda target: b"")
 
-        self.assertEqual(out, data)
+        self.assertEqual(out, b"Code: md\n  | Kind | Result |\n  | --- | --- |\n")
 
     def test_markdown_image_still_uses_renderer(self):
         data = b"before\n![alt](./img.png)\nafter\n"
 
-        out = send_markdown.render_text_chunk(data, lambda target: b"<image>")
+        out = send_markdown.render_text_chunk(data, lambda target: b"<image>\n")
 
         self.assertEqual(out, b"before\n<image>\nafter\n")
+
+    def test_standalone_image_does_not_keep_source_line_newline(self):
+        data = b"![alt](./img.png)\nafter\n"
+
+        out = send_markdown.render_text_chunk(data, lambda target: b"<image>\r\n")
+
+        self.assertEqual(out, b"<image>\r\nafter\n")
+
+    def test_heading_is_rendered_as_small_screen_title(self):
+        data = b"# Kitty MD LCD\n"
+
+        out = send_markdown.render_text_chunk(data, lambda target: b"")
+
+        self.assertEqual(out, b"== Kitty MD LCD ==\n")
 
 
 if __name__ == "__main__":

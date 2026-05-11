@@ -21,6 +21,7 @@ KITTY_END = b"\x1b\\"
 TEXT_ENCODING = "utf-8"
 MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\r\n]+)\)")
 TABLE_SEP_CELL_RE = re.compile(r"^:?-{3,}:?$")
+MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t#]*$")
 
 
 class RenderError(Exception):
@@ -209,20 +210,36 @@ def render_text_chunk(chunk: bytes, render_image: Callable[[str], bytes]) -> byt
 
     while idx < len(lines):
         line = lines[idx]
+        body, eol = strip_line_ending(line)
         stripped = line.lstrip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
-            out.append(line.encode(TEXT_ENCODING, errors="surrogateescape"))
+            if in_fence:
+                in_fence = False
+            else:
+                in_fence = True
+                lang = stripped[3:].strip()
+                label = f"Code: {lang}" if lang else "Code:"
+                out.append((label + eol).encode(TEXT_ENCODING, errors="surrogateescape"))
             idx += 1
             continue
         if in_fence:
-            out.append(line.encode(TEXT_ENCODING, errors="surrogateescape"))
+            out.append(("  " + line).encode(TEXT_ENCODING, errors="surrogateescape"))
+            idx += 1
+            continue
+        heading = MARKDOWN_HEADING_RE.match(body.strip())
+        if heading:
+            out.append(f"== {heading.group(2)} =={eol}".encode(TEXT_ENCODING))
             idx += 1
             continue
         if idx + 1 < len(lines) and is_markdown_table_header(line, lines[idx + 1]):
             table_lines, next_idx = collect_markdown_table(lines, idx)
             out.append(render_markdown_table(table_lines).encode(TEXT_ENCODING))
             idx = next_idx
+            continue
+        image_match = MARKDOWN_IMAGE_RE.fullmatch(body.strip())
+        if image_match:
+            out.append(render_image(image_match.group(2)))
+            idx += 1
             continue
 
         last = 0
@@ -293,9 +310,18 @@ def render_markdown_table(rows: List[List[str]]) -> str:
         max(len(row[col]) for row in padded)
         for col in range(col_count)
     ]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
     rendered: List[str] = []
-    for row in padded:
-        rendered.append("  ".join(cell.ljust(widths[col]) for col, cell in enumerate(row)).rstrip())
+    rendered.append(border)
+    for row_idx, row in enumerate(padded):
+        rendered.append(
+            "|"
+            + "|".join(f" {cell.ljust(widths[col])} " for col, cell in enumerate(row))
+            + "|"
+        )
+        if row_idx == 0:
+            rendered.append(border)
+    rendered.append(border)
     return "\n".join(rendered) + "\n"
 
 
