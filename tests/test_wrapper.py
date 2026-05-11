@@ -80,6 +80,29 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(adapter.feed(data[:4]), "前".encode())
         self.assertEqual(adapter.feed(data[4:]), "·后".encode())
 
+    def test_lcd_output_adapter_renders_live_markdown_table(self):
+        adapter = LcdOutputAdapter()
+        text = (
+            "  | 序号 | 名称 | 数量 | 备注 |\n"
+            "  |---:|---|---:|---|\n"
+            "  | 1 | 项目 A | 10 | 已完成 |\n"
+            "  | 2 | 项目 B | 5 | 进行中 |\n"
+            "\n"
+        )
+
+        out = adapter.feed(text.encode()).decode()
+
+        self.assertIn("+------+--------+------+--------+", out)
+        self.assertIn("| 序号 | 名称   | 数量 | 备注   |", out)
+        self.assertNotIn("|---:|---|---:|---|", out)
+
+    def test_lcd_output_adapter_flushes_non_table_pipe_lines(self):
+        adapter = LcdOutputAdapter()
+
+        out = adapter.feed(b"| just | text |\nnot a separator\n").decode()
+
+        self.assertEqual(out, "| just | text |\nnot a separator\n")
+
 
 if __name__ == "__main__":
     unittest.main()

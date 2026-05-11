@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import sys
 from typing import List, Optional, Tuple
 
@@ -42,6 +43,7 @@ ENV_LCD_CHAR_ADAPT = "VIBE_BRIDGE_LCD_CHAR_ADAPT"
 LEGACY_REAL_SOCK_PATH = "/tmp/vibe-real.sock"
 DEFAULT_LCD_COLS = 78
 DEFAULT_LCD_ROWS = 15
+TABLE_SEP_CELL_RE = re.compile(r"^:?-{3,}:?$")
 
 LCD_CHAR_REPLACEMENTS = str.maketrans(
     {
@@ -117,14 +119,131 @@ class LcdOutputAdapter:
 
     def __init__(self) -> None:
         self._decoder = codecs.getincrementaldecoder("utf-8")("surrogateescape")
+        self._pending_table_header: Optional[Tuple[List[str], str]] = None
+        self._table_rows: Optional[List[List[str]]] = None
 
     def feed(self, data: bytes) -> bytes:
         text = self._decoder.decode(data, final=False)
         if not text:
             return b""
-        return text.translate(LCD_CHAR_REPLACEMENTS).encode(
-            "utf-8", errors="surrogateescape"
+        text = text.translate(LCD_CHAR_REPLACEMENTS)
+        return self._render_live_markdown(text).encode("utf-8", errors="surrogateescape")
+
+    def _render_live_markdown(self, text: str) -> str:
+        out: List[str] = []
+        for line in text.splitlines(keepends=True):
+            if not line.endswith(("\n", "\r")):
+                out.append(self._flush_table_state())
+                out.append(line)
+                continue
+            out.append(self._process_complete_line(line))
+        return "".join(out)
+
+    def _process_complete_line(self, line: str) -> str:
+        if "\x1b" in line:
+            return self._flush_table_state() + line
+
+        row = _parse_markdown_table_row(line)
+        if self._table_rows is not None:
+            if row is not None:
+                self._table_rows.append(row)
+                return ""
+            return self._flush_table_state() + self._process_complete_line(line)
+
+        if self._pending_table_header is not None:
+            header, original = self._pending_table_header
+            self._pending_table_header = None
+            if _is_markdown_table_separator(line):
+                self._table_rows = [header]
+                return ""
+            return original + self._process_complete_line(line)
+
+        if row is not None:
+            self._pending_table_header = (row, line)
+            return ""
+        return line
+
+    def _flush_table_state(self) -> str:
+        out = ""
+        if self._table_rows is not None:
+            out += _render_lcd_table(self._table_rows)
+            self._table_rows = None
+        if self._pending_table_header is not None:
+            out += self._pending_table_header[1]
+            self._pending_table_header = None
+        return out
+
+
+def _strip_line_ending(line: str) -> Tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith("\n") or line.endswith("\r"):
+        return line[:-1], line[-1]
+    return line, ""
+
+
+def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
+    body, _ = _strip_line_ending(line)
+    body = body.strip()
+    if "|" not in body:
+        return None
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|"):
+        body = body[:-1]
+    cells = [cell.strip() for cell in body.split("|")]
+    return cells if len(cells) >= 2 else None
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    cells = _parse_markdown_table_row(line)
+    if not cells:
+        return False
+    return all(TABLE_SEP_CELL_RE.match(cell.replace(" ", "")) for cell in cells)
+
+
+def _render_lcd_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    col_count = max(len(row) for row in rows)
+    padded = [row + [""] * (col_count - len(row)) for row in rows]
+    widths = [max(_lcd_text_width(row[col]) for row in padded) for col in range(col_count)]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    rendered: List[str] = [border]
+    for row_idx, row in enumerate(padded):
+        rendered.append(
+            "|"
+            + "|".join(f" {_pad_lcd_text(cell, widths[col])} " for col, cell in enumerate(row))
+            + "|"
         )
+        if row_idx == 0:
+            rendered.append(border)
+    rendered.append(border)
+    return "\n".join(rendered) + "\n"
+
+
+def _pad_lcd_text(text: str, width: int) -> str:
+    return text + " " * max(0, width - _lcd_text_width(text))
+
+
+def _lcd_text_width(text: str) -> int:
+    width = 0
+    for ch in text:
+        cp = ord(ch)
+        if (
+            0x1100 <= cp <= 0x115F
+            or 0x2E80 <= cp <= 0xA4CF
+            or 0xAC00 <= cp <= 0xD7A3
+            or 0xF900 <= cp <= 0xFAFF
+            or 0xFE10 <= cp <= 0xFE6F
+            or 0xFF00 <= cp <= 0xFF60
+            or 0xFFE0 <= cp <= 0xFFE6
+            or 0x20000 <= cp <= 0x3FFFD
+        ):
+            width += 2
+        else:
+            width += 1
+    return width
 
 
 def find_real_binary(name: str, *, exclude_paths: List[str]) -> Optional[str]:
