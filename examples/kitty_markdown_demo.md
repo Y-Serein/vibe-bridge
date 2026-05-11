@@ -1,19 +1,15 @@
-# Kitty Markdown Demo
+# Kitty MD LCD
 
-Plain Markdown text should continue through the existing VT100 stream.
+Text stays readable.
 
-| Item | Expected LCD result |
+| Kind | Result |
 | --- | --- |
-| Text | normal characters |
-| Table | markdown table remains text |
-| Code | fenced block remains text |
-| Image | rendered by SG2002 Kitty PNG path |
+| table | text |
 
-```python
-def hello_keyboard():
-    print("VT100 text stays readable")
+```py
+print("code ok")
 ```
 
 ![verified SG2002 kitty render](./kitty_demo_image.ppm)
 
-Text after the image should appear below the image placement.
+After image: below placement.
