@@ -63,6 +63,10 @@ def _set_winsize(fd: int, packed: bytes) -> None:
         pass
 
 
+def _pack_winsize(rows: int, cols: int) -> bytes:
+    return struct.pack("HHHH", rows, cols, 0, 0)
+
+
 def run_with_pty(
     argv: Sequence[str],
     *,
@@ -70,6 +74,7 @@ def run_with_pty(
     on_output: Optional[ChunkCallback] = None,
     stdin_fd: Optional[int] = None,
     stdout_fd: Optional[int] = None,
+    winsize: Optional[tuple[int, int]] = None,
 ) -> int:
     """Spawn ``argv`` under a PTY; tee output to stdout + ``on_output``.
 
@@ -105,11 +110,16 @@ def run_with_pty(
     parent_in_is_tty = _isatty(in_fd)
     saved_termios: Optional[list] = None
 
-    initial_winsize = _get_winsize(in_fd) if parent_in_is_tty else None
+    initial_winsize = _pack_winsize(*winsize) if winsize is not None else (
+        _get_winsize(in_fd) if parent_in_is_tty else None
+    )
     if initial_winsize is not None:
         _set_winsize(master_fd, initial_winsize)
 
     def _on_winch(signum, frame):  # noqa: ARG001
+        if winsize is not None:
+            _set_winsize(master_fd, _pack_winsize(*winsize))
+            return
         ws = _get_winsize(in_fd) if parent_in_is_tty else None
         if ws is not None:
             _set_winsize(master_fd, ws)

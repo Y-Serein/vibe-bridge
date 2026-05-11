@@ -21,6 +21,7 @@ being broken.
 
 from __future__ import annotations
 
+import codecs
 import os
 import sys
 from typing import List, Optional, Tuple
@@ -35,7 +36,75 @@ ENV_SOCK_PATH = "VIBE_SOCK_PATH"
 ENV_DISABLE = "VIBE_BRIDGE_DISABLE"
 ENV_FORWARD_MODE = "VIBE_BRIDGE_FORWARD"  # "pty" | "exec" | unset (=auto)
 ENV_REUSE_SESSION = "VIBE_BRIDGE_REUSE_SESSION"
+ENV_LCD_COLS = "VIBE_BRIDGE_LCD_COLS"
+ENV_LCD_ROWS = "VIBE_BRIDGE_LCD_ROWS"
+ENV_LCD_CHAR_ADAPT = "VIBE_BRIDGE_LCD_CHAR_ADAPT"
 LEGACY_REAL_SOCK_PATH = "/tmp/vibe-real.sock"
+DEFAULT_LCD_COLS = 78
+DEFAULT_LCD_ROWS = 15
+
+LCD_CHAR_REPLACEMENTS = str.maketrans(
+    {
+        "⏺": "*",
+        "⎿": "`",
+        "╭": "+",
+        "╮": "+",
+        "╰": "+",
+        "╯": "+",
+        "┌": "+",
+        "┐": "+",
+        "└": "+",
+        "┘": "+",
+        "├": "+",
+        "┤": "+",
+        "┬": "+",
+        "┴": "+",
+        "┼": "+",
+        "─": "-",
+        "━": "-",
+        "═": "-",
+        "│": "|",
+        "┃": "|",
+        "║": "|",
+        "•": "*",
+        "◦": "*",
+        "▪": "*",
+        "▫": "*",
+        "■": "*",
+        "□": "*",
+        "◆": "*",
+        "◇": "*",
+        "●": "*",
+        "○": "o",
+        "✓": "v",
+        "✔": "v",
+        "✗": "x",
+        "✘": "x",
+        "×": "x",
+        "…": "...",
+        "→": "->",
+        "←": "<-",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
+
+
+class LcdOutputAdapter:
+    """Small, stateful output adapter for the SG2002 LCD terminal."""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("surrogateescape")
+
+    def feed(self, data: bytes) -> bytes:
+        text = self._decoder.decode(data, final=False)
+        if not text:
+            return b""
+        return text.translate(LCD_CHAR_REPLACEMENTS).encode(
+            "utf-8", errors="surrogateescape"
+        )
 
 
 def find_real_binary(name: str, *, exclude_paths: List[str]) -> Optional[str]:
@@ -92,6 +161,23 @@ def _existing_session_from_env() -> Optional[int]:
         return None
 
 
+def _parse_positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _lcd_pty_size() -> Tuple[int, int]:
+    rows = _parse_positive_env_int(ENV_LCD_ROWS, DEFAULT_LCD_ROWS)
+    cols = _parse_positive_env_int(ENV_LCD_COLS, DEFAULT_LCD_COLS)
+    return rows, cols
+
+
 def run(
     plugin_name: str,
     *,
@@ -126,6 +212,10 @@ def run(
     env[ENV_SOCK_PATH] = sock_path
     if session_id is not None:
         env[ENV_SESSION_ID] = str(session_id)
+    if mode == "pty":
+        rows, cols = _lcd_pty_size()
+        env["LINES"] = str(rows)
+        env["COLUMNS"] = str(cols)
 
     if mode == "pty" and session_id is not None and plugin is not None:
         return _run_pty(real, new_argv, env, plugin)
@@ -155,13 +245,19 @@ def _run_pty(
 
     forwarder = Forwarder(plugin.send_vt100)
     forwarder.start()
+    adapter = None if os.environ.get(ENV_LCD_CHAR_ADAPT) == "0" else LcdOutputAdapter()
 
     def on_output(chunk: bytes) -> None:
-        forwarder.push(chunk)
+        forwarder.push(adapter.feed(chunk) if adapter is not None else chunk)
 
     real_argv = [real] + new_argv[1:]  # argv[0] should be the program path
     try:
-        return run_with_pty(real_argv, env=env, on_output=on_output)
+        return run_with_pty(
+            real_argv,
+            env=env,
+            on_output=on_output,
+            winsize=_lcd_pty_size(),
+        )
     finally:
         forwarder.stop(timeout=0.5)
         plugin.close()

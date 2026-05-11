@@ -4,11 +4,17 @@ from unittest import mock
 
 from vibe_bridge.mock_hid import DEFAULT_SOCK_PATH
 from vibe_bridge.wrapper import (
+    DEFAULT_LCD_COLS,
+    DEFAULT_LCD_ROWS,
+    ENV_LCD_COLS,
+    ENV_LCD_ROWS,
     ENV_REUSE_SESSION,
     ENV_SESSION_ID,
     ENV_SOCK_PATH,
+    LcdOutputAdapter,
     LEGACY_REAL_SOCK_PATH,
     _existing_session_from_env,
+    _lcd_pty_size,
     _resolve_sock_path,
 )
 
@@ -48,6 +54,28 @@ class WrapperTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(_existing_session_from_env(), 42)
+
+    def test_lcd_pty_size_defaults_to_current_lcd_grid(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_lcd_pty_size(), (DEFAULT_LCD_ROWS, DEFAULT_LCD_COLS))
+
+    def test_lcd_pty_size_reads_environment(self):
+        with mock.patch.dict(
+            os.environ,
+            {ENV_LCD_ROWS: "10", ENV_LCD_COLS: "40"},
+            clear=True,
+        ):
+            self.assertEqual(_lcd_pty_size(), (10, 40))
+
+    def test_lcd_output_adapter_replaces_tui_symbols(self):
+        adapter = LcdOutputAdapter()
+        self.assertEqual(adapter.feed("⏺ Claude ╭─╮ ✓\n".encode()), b"* Claude +-+ v\n")
+
+    def test_lcd_output_adapter_handles_split_utf8(self):
+        adapter = LcdOutputAdapter()
+        data = "前⏺后".encode()
+        self.assertEqual(adapter.feed(data[:4]), "前".encode())
+        self.assertEqual(adapter.feed(data[4:]), "*后".encode())
 
 
 if __name__ == "__main__":
