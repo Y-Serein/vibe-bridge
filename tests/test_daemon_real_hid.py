@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import json
 import os
 import queue
 import tempfile
@@ -7,6 +9,7 @@ import threading
 import time
 import unittest
 from typing import List, Optional
+from unittest import mock
 
 from vibe_bridge.daemon import Daemon, DaemonConfig
 from vibe_bridge.hid_protocol import (
@@ -41,7 +44,7 @@ def _wait_until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> b
 
 class FakeHidTransport(Transport):
     def __init__(self) -> None:
-        self._incoming: "queue.Queue[Optional[Packet]]" = queue.Queue()
+        self._incoming: "queue.Queue[object]" = queue.Queue()
         self._sent: List[Packet] = []
         self._sent_lock = threading.Lock()
         self.closed = False
@@ -52,9 +55,12 @@ class FakeHidTransport(Transport):
 
     def recv_packet(self, timeout: Optional[float] = None) -> Optional[Packet]:
         try:
-            return self._incoming.get(timeout=timeout)
+            item = self._incoming.get(timeout=timeout)
         except queue.Empty:
             return None
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def close(self) -> None:
         self.closed = True
@@ -62,6 +68,9 @@ class FakeHidTransport(Transport):
 
     def inject(self, packet: Packet) -> None:
         self._incoming.put(packet)
+
+    def inject_error(self, exc: BaseException) -> None:
+        self._incoming.put(exc)
 
     def sent(self) -> List[Packet]:
         with self._sent_lock:
@@ -91,6 +100,10 @@ class RealHidDaemonTests(unittest.TestCase):
     def _wait_for_sent(self, count: int) -> None:
         ok = _wait_until(lambda: len(self.hid.sent()) >= count)
         self.assertTrue(ok, f"expected {count} hid writes, got {self.hid.sent()!r}")
+
+    def _read_state(self) -> dict:
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def _acquire_session(self, client: MockHidClient, hint: bytes, sid: int) -> Packet:
         before = len(self.hid.sent())
@@ -150,6 +163,34 @@ class RealHidDaemonTests(unittest.TestCase):
         finally:
             c1.close()
             c2.close()
+
+    def test_ui_scale_change_is_forwarded_to_board(self) -> None:
+        client = MockHidClient(self.sock_path)
+        try:
+            scale_pkt = Packet(
+                report_id=int(ReportId.HOST_BOUND),
+                command=int(Cmd.UI_SCALE_CHANGE),
+                session_id=0,
+                payload=bytes([12, 24]),
+            )
+            client.send_packet(scale_pkt)
+            self._wait_for_sent(1)
+            forwarded = [
+                p for p in self.hid.sent() if p.command == int(Cmd.UI_SCALE_CHANGE)
+            ]
+            self.assertEqual(len(forwarded), 1)
+            self.assertEqual(forwarded[0].session_id, 0)
+            self.assertEqual(forwarded[0].payload, bytes([12, 24]))
+        finally:
+            client.close()
+
+    def test_hid_disconnect_marks_state_unavailable_for_bootstrap_recovery(self) -> None:
+        with mock.patch("vibe_bridge.daemon.log"):
+            self.hid.inject_error(OSError(errno.ENODEV, "device gone"))
+            ok = _wait_until(lambda: self._read_state().get("mode") == "mock")
+        self.assertTrue(ok)
+        state = self._read_state()
+        self.assertIsNone(state.get("hidraw_path"))
 
 
 if __name__ == "__main__":

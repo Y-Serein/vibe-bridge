@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Optional
 
+from .bootstrap import can_connect
 from .daemon import Daemon, DaemonConfig, DEFAULT_STATE_PATH
 from .hid_protocol import (
     Cmd,
@@ -67,6 +69,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pwa.add_argument("--sid", type=int, required=True)
 
+    pus = sub.add_parser(
+        "set-ui-scale",
+        help="Emit CMD_UI_SCALE_CHANGE; payload is [u8 cell_w, u8 cell_h]",
+    )
+    pus.add_argument("--cell-w", type=int, required=True,
+                     help="Terminal cell width in pixels (e.g. 8/10/12/16)")
+    pus.add_argument("--cell-h", type=int, required=True,
+                     help="Terminal cell height in pixels (e.g. 16/20/24/32)")
+
     ph = sub.add_parser("hid", help="Real /dev/hidraw* probing tools")
     hsub = ph.add_subparsers(dest="hid_cmd", required=True)
 
@@ -117,7 +128,15 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         print(f"no state file at {args.state} (is the daemon running?)", file=sys.stderr)
         return 1
-    print(f"daemon socket : {state.get('sock_path')}")
+    sock_path = state.get("sock_path") or args.sock
+    reachable = can_connect(sock_path) if isinstance(sock_path, str) else False
+    print(f"daemon socket : {sock_path}")
+    print(f"socket status : {'reachable' if reachable else 'unreachable/stale'}")
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(args.state))
+        print(f"state age     : {age:.1f}s")
+    except OSError:
+        pass
     if state.get("mode") is not None:
         print(f"mode          : {state.get('mode')}")
     if state.get("hidraw_path"):
@@ -234,6 +253,25 @@ def cmd_window_activate(args: argparse.Namespace) -> int:
     try:
         client.send_packet(pkt)
         print(f"window-activate sid={args.sid} sent")
+        return 0
+    finally:
+        client.close()
+
+
+def cmd_set_ui_scale(args: argparse.Namespace) -> int:
+    if not (1 <= int(args.cell_w) <= 255) or not (1 <= int(args.cell_h) <= 255):
+        print("set-ui-scale: cell_w/cell_h must be in 1..255", file=sys.stderr)
+        return 2
+    pkt = Packet(
+        report_id=int(ReportId.HOST_BOUND),
+        command=int(Cmd.UI_SCALE_CHANGE),
+        session_id=SESSION_BROADCAST,
+        payload=bytes([int(args.cell_w) & 0xFF, int(args.cell_h) & 0xFF]),
+    )
+    client = MockHidClient(args.sock)
+    try:
+        client.send_packet(pkt)
+        print(f"set-ui-scale {args.cell_w}x{args.cell_h} sent")
         return 0
     finally:
         client.close()
@@ -401,6 +439,7 @@ def main(argv: Optional[list] = None) -> int:
         "tail-screen": cmd_tail_screen,
         "window-switch": cmd_window_switch,
         "window-activate": cmd_window_activate,
+        "set-ui-scale": cmd_set_ui_scale,
     }
     if args.cmd == "hid":
         hid_dispatch = {

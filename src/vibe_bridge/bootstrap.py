@@ -8,6 +8,7 @@ running, ``ensure_daemon_running`` spawns a new detached one and waits up to
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -20,6 +21,7 @@ from .mock_hid import DEFAULT_SOCK_PATH
 ENV_HIDRAW_DEVICE = "VIBE_HIDRAW_DEVICE"
 VIBE_USB_VID = 0x359F
 VIBE_USB_PID = 0x2120
+DEFAULT_STATE_PATH = "/tmp/vibe-bridge-state.json"
 
 
 def can_connect(sock_path: str, *, timeout: float = 0.2) -> bool:
@@ -108,9 +110,45 @@ def resolve_hidraw_device() -> Optional[str]:
     return None
 
 
+def _load_daemon_state(state_path: str) -> Optional[dict]:
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _state_matches_hidraw_daemon(
+    sock_path: str, hidraw_device: str, state_path: str
+) -> bool:
+    state = _load_daemon_state(state_path)
+    if state is None:
+        return False
+    if state.get("sock_path") != sock_path:
+        return False
+    if state.get("mode") != "real-hidraw":
+        return False
+    state_hidraw = state.get("hidraw_path")
+    if not isinstance(state_hidraw, str) or not state_hidraw:
+        return False
+    return os.path.realpath(state_hidraw) == os.path.realpath(hidraw_device)
+
+
+def _daemon_ready(sock_path: str, hidraw_device: Optional[str], state_path: str) -> bool:
+    if not can_connect(sock_path):
+        return False
+    if hidraw_device is None:
+        return True
+    if sock_path != DEFAULT_SOCK_PATH:
+        return True
+    return _state_matches_hidraw_daemon(sock_path, hidraw_device, state_path)
+
+
 def ensure_daemon_running(
     sock_path: str = DEFAULT_SOCK_PATH,
     *,
+    state_path: str = DEFAULT_STATE_PATH,
     timeout: float = 3.0,
     poll_interval: float = 0.1,
     log_path: str = "/tmp/vibe-bridge-daemon.log",
@@ -121,16 +159,17 @@ def ensure_daemon_running(
     Returns False if no daemon could be reached in time; callers should fall
     back to running their CLI without a session.
     """
-    if can_connect(sock_path):
-        return True
-    extra_args = []
     hidraw_device = resolve_hidraw_device()
+    if _daemon_ready(sock_path, hidraw_device, state_path):
+        return True
+
+    extra_args = ["--state", state_path]
     if hidraw_device:
         extra_args.extend(["--hidraw", hidraw_device])
     spawn_daemon_detached(sock_path, log_path=log_path, extra_args=extra_args)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if can_connect(sock_path):
+        if _daemon_ready(sock_path, hidraw_device, state_path):
             return True
         time.sleep(poll_interval)
     return False

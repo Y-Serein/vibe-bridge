@@ -318,11 +318,13 @@ class Daemon:
                 pkt = hid.recv_packet(timeout=0.5)
             except TransportClosed as exc:
                 log.warning("hidraw closed: %s", exc)
+                self._mark_hidraw_unavailable()
                 return
             except OSError as exc:
                 log.warning("hidraw read error: %s", exc)
                 if exc.errno in (errno.EIO, errno.ENODEV):
                     log.warning("hidraw reader stopped; restart daemon after board reconnect")
+                    self._mark_hidraw_unavailable()
                     return
                 time.sleep(0.1)
                 continue
@@ -332,6 +334,18 @@ class Daemon:
             if pkt is None:
                 continue
             self._handle_hid_packet(pkt)
+
+    def _mark_hidraw_unavailable(self) -> None:
+        with self._hid_lock:
+            hid = self._hid
+            self._hid = None
+            self.config.hidraw_path = None
+        if hid is not None:
+            try:
+                hid.close()
+            except Exception:
+                pass
+        self._dump_state()
 
     def _handle_hid_packet(self, packet: Packet) -> None:
         try:
