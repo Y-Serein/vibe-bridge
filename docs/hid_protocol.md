@@ -42,8 +42,8 @@ fragment so behaviour is identical on real HID.
 | 0x01  | `REQUEST_SESSION`   | plugin → bridge    | optional UTF-8 plugin/wrapper hint             |
 | 0x02  | `SESSION_RESPONSE`  | bridge → plugin    | `[Status]` (1 byte)                            |
 | 0x03  | `SESSION_INVALID`   | bridge → plugin    | `[Status]`                                     |
-| 0x10  | `KEY_EVENT`         | bridge ↔ plugin    | TBD: `keycode, modifiers, pressed`             |
-| 0x11  | `ENCODER_EVENT`     | bridge ↔ plugin    | TBD: `[delta:i8]`                              |
+| 0x10  | `KEY_EVENT`         | board → bridge → plugin | `[key_bits:u8, enc_sw:u8]`                 |
+| 0x11  | `ENCODER_EVENT`     | board → bridge → plugin | `[delta:i8]`                               |
 | 0x20  | `WINDOW_SWITCH`     | plugin/HW → bridge | `[delta:i8]` (-1 prev, +1 next, 0 noop)        |
 | 0x21  | `WINDOW_ACTIVATE`   | plugin → bridge    | empty; activates `session_id`                  |
 | 0x30  | `VT100_STREAM`      | plugin → bridge    | UTF-8 / VT100 byte stream                      |
@@ -111,6 +111,79 @@ plugin/wrapper                 bridge daemon                    board firmware
   | --- VT100_STREAM(sid=N) ---> | --- VT100_STREAM(sid=N) -----> |
 ```
 
+## Board input events
+
+The early `docs/hid_vendor_terminal_spec.pdf` described a 7-key vendor-input
+sketch where report `0x10` directly packed keys and encoder delta into report
+bytes. The current implementation keeps the same report IDs but uses the
+packet header above for session routing and command dispatch. Do not revert to
+the PDF byte layout unless the whole board/host packet layer is intentionally
+replaced.
+
+Current AIKB firmware emits normal buttons and encoder push through
+`CMD_KEY_EVENT`:
+
+```
+report_id        = 0x10  # HOST_BOUND, board -> host
+command          = 0x10  # KEY_EVENT
+session_id       = 0     # broadcast; daemon rewrites to active sid
+payload_length   = 2
+payload[0]       = key_bits
+payload[1] bit0  = encoder push switch, pressed = 1
+payload[1] bit1..7 reserved, send as 0
+```
+
+`payload[0]` key bit assignment:
+
+| Bit | Physical input | Board action name | Current video state |
+| --- | -------------- | ----------------- | ------------------- |
+| 0   | KEY1 / A15     | Reject            | `reject.264`        |
+| 1   | KEY2 / A24     | Voice             | `voice.264`         |
+| 2   | KEY3 / A23     | Session           | `session.264`       |
+| 3   | KEY4 / A27     | Vote / Review     | `vote_review.264`   |
+| 4   | KEY5 / A25     | Agent / Model     | `agent_model.264`   |
+| 5   | KEY6 / A22     | Multi Function    | `multi.264`         |
+| 6   | KEY7 / A29     | Confirm           | `confirm.264`       |
+| 7   | KEY8 / P19     | Menu / Debug      | `menu_debug.264`    |
+
+Action intent:
+
+- `REJECT`: cancel, reject, stop the current AI task, or go back one layer.
+- `VOICE`: enter voice input. If recording is not implemented yet, show a
+  voice-input placeholder state.
+- `SESSION`: open the session/task selection panel.
+- `VOTE_REVIEW`: open the rating, choice, or review panel for the current AI
+  output.
+- `AGENT_MODEL`: open the model/agent selection panel for Claude, Codex,
+  Gemini, Local, or fast/deep mode switching.
+- `MULTI_FUNCTION`: open a shortcut panel for lower-frequency actions such as
+  save, commit, apply all, screenshot, settings, brightness, volume, and
+  network status.
+- `CONFIRM`: confirm, send, execute the highlighted action, or apply the
+  current suggestion.
+- `MENU_DEBUG`: short press opens the main menu or debug menu; reserved for
+  future expansion.
+- `ENC_SW / P21`: select/enter. This is a light confirm or drill-in action.
+
+Encoder A/B (`P22` / `P23`) is used for list scrolling, candidate selection,
+and parameter adjustment. Encoder push selects/enters; `CONFIRM` is reserved
+for stronger execute/apply semantics.
+
+The encoder quadrature delta is separate:
+
+```
+report_id        = 0x10  # HOST_BOUND, board -> host
+command          = 0x11  # ENCODER_EVENT
+session_id       = 0     # broadcast; daemon rewrites to active sid
+payload_length   = 1
+payload[0]       = signed int8 delta, -127..127
+```
+
+The bridge daemon handles encoder delta locally to switch active windows, then
+routes the same `ENCODER_EVENT` to the active plugin. `KEY_EVENT` is only routed
+to the active plugin; board-local video switching is handled by the board-side
+event FIFO and `auto.sh`, not by the host daemon.
+
 ## Wire compatibility goals
 
 - The on-board firmware (`middleware/v2/sample/aikb_hid_input/`) currently
@@ -131,5 +204,8 @@ plugin/wrapper                 bridge daemon                    board firmware
   is TBD if real hardware shows loss/reordering issues.
 - **Feature reports** (`ReportId.FEATURE = 0x30`) are reserved for future
   config queries (font sizes, screen geometry).
-- **Encoder / key event payload schemas** are TBD; the on-board layout in
-  `aikb_hid_input.c` (key0..key2, encoder delta) will dictate the bytes.
+- **Input action semantics beyond routing.** The transport now defines the
+  board key bits and encoder bytes. Higher-level plugin behaviour for
+  Reject/Voice/Session/Vote-Review/Agent-Model/Multi-Function/Confirm/Menu is
+  still owned by the active plugin or board-side video state mapping; the
+  daemon stays a packet router.

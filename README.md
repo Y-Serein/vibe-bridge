@@ -71,6 +71,126 @@ Override with `--sock`, `--state`, `--screen`.
 
 ---
 
+## Real hardware deployment
+
+Use this section when moving vibe-bridge to another Linux/WSL host.
+
+Prerequisites:
+
+- The board image contains the new-protocol `aikb_hid_input` and `aikb_lcd_ui`.
+- The board is powered on and exposes a Vibe HID device with `VID:PID 359f:2120`.
+- The host has Python >= 3.9 and the real CLI tools, such as `codex` or
+  `claude`, already installed somewhere later on `$PATH`.
+
+Install the host bridge:
+
+```bash
+git clone <repo-url> vibe-bridge
+cd vibe-bridge
+PYTHONPATH=src python3 -m unittest discover -s tests
+PYTHONPATH=src python3 -m vibe_bridge.main hid list
+```
+
+Probe the board. Replace `/dev/hidraw0` if `hid list` shows a different node:
+
+```bash
+./scripts/probe_hidraw.sh /dev/hidraw0
+```
+
+A healthy new-protocol board prints `RESULT=PASS` and the LCD should show the
+probe text. If the device exists but is not writable, fix hidraw permissions
+with a udev rule or a temporary local permission change for that node.
+
+Put the wrappers in front of the real CLIs. Symlinks are convenient when this
+repo is not itself on `$PATH`:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf "$PWD/bin/codex" ~/.local/bin/codex
+ln -sf "$PWD/bin/claude" ~/.local/bin/claude
+```
+
+Make sure `~/.local/bin` appears before the real CLI install directory:
+
+```bash
+command -v codex
+command -v claude
+```
+
+Normal use after setup is just:
+
+```bash
+codex
+```
+
+The wrapper auto-starts the daemon if needed, auto-detects the Vibe HID device,
+requests a fresh board-assigned session id, and mirrors the interactive PTY
+output to the LCD. Opening another top-level `codex` creates another window.
+The encoder switches active windows. Exiting a wrapper releases its window; if
+it was active, the daemon switches to another live window and replays that
+buffer.
+
+### Board controls
+
+The board keeps the physical pin order stable and reports button state through
+`CMD_KEY_EVENT`. The daemon routes key events to the active plugin/wrapper; it
+does not hard-code product actions. Board-local video feedback uses the same
+semantic names.
+
+| Input | Pin | HID bit | Name | Behaviour |
+| --- | --- | --- | --- | --- |
+| KEY1 | A15 | bit0 | `REJECT` | Cancel, reject, stop the current AI task, or go back one layer. |
+| KEY2 | A24 | bit1 | `VOICE` | Enter voice input; hold-to-record/release-to-send when recording is available, otherwise show the voice placeholder state. |
+| KEY3 | A23 | bit2 | `SESSION` | Open the session or task selection panel. |
+| KEY4 | A27 | bit3 | `VOTE_REVIEW` | Open rating, choice, or review controls for the current AI output. |
+| KEY5 | A25 | bit4 | `AGENT_MODEL` | Open model/agent selection for Claude, Codex, Gemini, Local, or fast/deep modes. |
+| KEY6 | A22 | bit5 | `MULTI_FUNCTION` | Open low-frequency shortcuts: save, commit, apply all, screenshot, settings, brightness, volume, and network state. |
+| KEY7 | A29 | bit6 | `CONFIRM` | Confirm, send, execute the highlighted action, or apply the current suggestion. |
+| KEY8 | P19 | bit7 | `MENU_DEBUG` | Open the main menu or debug menu; reserved for later expansion. |
+| ENC_SW | P21 | payload[1] bit0 | `SELECT_ENTER` | Light confirm, select, or drill into the highlighted item. |
+| ENC_A / ENC_B | P22 / P23 | `ENCODER_EVENT` delta | `ROTARY` | Scroll lists, choose candidates, and adjust parameters. |
+
+Use the encoder push for light selection and `CONFIRM` for stronger execute or
+apply semantics.
+
+By default the LCD receives the PTY stream through a small compatibility layer:
+missing prompt/bullet glyphs are downgraded to ASCII/`·`, reverse-video input
+rows get a visible background, and Markdown table rendering is skipped for
+prompt/system lines. Use raw forwarding only for diagnosis:
+
+```bash
+VIBE_BRIDGE_LCD_CHAR_ADAPT=0 codex
+VIBE_BRIDGE_LCD_THEME=gruvbox codex
+```
+
+If `/tmp/vibe-bridge.sock` is reachable but its state file says `mode: mock`,
+the wrapper does not reuse it when a Vibe HID device is present. It starts a
+fresh `real-hidraw` daemon on the default socket so a stale mock daemon cannot
+silently swallow Codex output.
+
+Inspect the current daemon and session table:
+
+```bash
+PYTHONPATH=/path/to/vibe-bridge/src python3 -m vibe_bridge.main sessions
+```
+
+Useful overrides:
+
+```bash
+VIBE_HIDRAW_DEVICE=/dev/hidraw1 codex
+VIBE_SOCK_PATH=/tmp/custom-vibe.sock codex
+VIBE_BRIDGE_DISABLE=1 codex
+VIBE_BRIDGE_LCD_CHAR_ADAPT=0 codex
+```
+
+After unplugging/replugging or rebooting the board, the hidraw node may change
+and the board-side session table resets. If the old real daemon sees the
+hidraw fd disappear, it marks its state as unavailable so the next wrapper run
+can start a fresh real daemon. Use `sessions` to confirm the daemon is attached
+to the current `/dev/hidraw*`.
+
+---
+
 ## CLI
 
 ```
@@ -92,7 +212,7 @@ vibe-bridge window-activate --sid N             # activate a specific session
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-57 tests, no external dependencies.
+108 tests, no external dependencies.
 
 ---
 
@@ -110,7 +230,8 @@ The wrapper:
 
 1. Walks `$PATH` to find the real binary, skipping itself.
 2. Calls `ensure_daemon_running` — spawns a detached daemon if the socket isn't
-   there, auto-detecting the Vibe HID device (`VID:PID 359f:2120`) when present.
+   there, or if the default socket is still a mock daemon while a Vibe HID
+   device (`VID:PID 359f:2120`) is present.
 3. Acquires a fresh session id for each top-level wrapper run.
 4. Exports `VIBE_SESSION_ID` and `VIBE_SOCK_PATH`; in an interactive TTY it
    runs the real CLI under a PTY and forwards VT100 output to the active window,

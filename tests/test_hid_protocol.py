@@ -1,6 +1,7 @@
 import unittest
 
 from vibe_bridge.hid_protocol import (
+    BoardKey,
     Cmd,
     HEADER_SIZE,
     MAX_PAYLOAD_PER_FRAME,
@@ -8,7 +9,12 @@ from vibe_bridge.hid_protocol import (
     ProtocolError,
     ReportId,
     Status,
+    decode_encoder_delta_payload,
+    decode_key_event_payload,
+    encode_key_event_payload,
     fragment_payload,
+    make_encoder_event,
+    make_key_event,
     make_request_session,
     make_session_response,
     make_vt100_chunk,
@@ -68,6 +74,40 @@ class HelpersTests(unittest.TestCase):
         chunk = make_vt100_chunk(7, b"hi")
         self.assertIs(chunk.cmd(), Cmd.VT100_STREAM)
         self.assertEqual(chunk.payload, b"hi")
+
+    def test_key_event_payload_helpers(self):
+        payload = encode_key_event_payload(
+            (1 << BoardKey.REJECT) | (1 << BoardKey.VOTE_REVIEW),
+            encoder_pressed=True,
+        )
+        event = decode_key_event_payload(payload)
+        self.assertTrue(event.pressed(BoardKey.REJECT))
+        self.assertFalse(event.pressed(BoardKey.VOICE))
+        self.assertTrue(event.pressed(BoardKey.VOTE_REVIEW))
+        self.assertTrue(event.encoder_pressed)
+
+    def test_key_event_payload_rejects_truncated_payload(self):
+        with self.assertRaises(ProtocolError):
+            decode_key_event_payload(b"\x01")
+
+    def test_key_event_packet_helper(self):
+        pkt = make_key_event(1 << BoardKey.MENU_DEBUG, encoder_pressed=False)
+        self.assertIs(pkt.cmd(), Cmd.KEY_EVENT)
+        self.assertEqual(pkt.report_id, int(ReportId.HOST_BOUND))
+        event = decode_key_event_payload(pkt.payload)
+        self.assertTrue(event.pressed(BoardKey.MENU_DEBUG))
+        self.assertFalse(event.encoder_pressed)
+
+    def test_encoder_event_helpers_use_signed_i8(self):
+        self.assertEqual(decode_encoder_delta_payload(bytes([0x01])), 1)
+        self.assertEqual(decode_encoder_delta_payload(bytes([0xFF])), -1)
+        pkt = make_encoder_event(-2)
+        self.assertIs(pkt.cmd(), Cmd.ENCODER_EVENT)
+        self.assertEqual(decode_encoder_delta_payload(pkt.payload), -2)
+
+    def test_encoder_event_payload_rejects_empty_payload(self):
+        with self.assertRaises(ProtocolError):
+            decode_encoder_delta_payload(b"")
 
 
 class FragmentationTests(unittest.TestCase):

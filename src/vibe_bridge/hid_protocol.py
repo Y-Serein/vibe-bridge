@@ -74,6 +74,19 @@ class Status(IntEnum):
     RECLAIMED = 0x05
 
 
+class BoardKey(IntEnum):
+    """AIKB physical key bit indexes in ``Cmd.KEY_EVENT`` payload byte 0."""
+
+    REJECT = 0
+    VOICE = 1
+    SESSION = 2
+    VOTE_REVIEW = 3
+    AGENT_MODEL = 4
+    MULTI_FUNCTION = 5
+    CONFIRM = 6
+    MENU_DEBUG = 7
+
+
 class ProtocolError(Exception):
     """Raised when a packet cannot be parsed."""
 
@@ -115,6 +128,47 @@ class Packet:
 
     def cmd(self) -> Cmd:
         return Cmd(self.command)
+
+
+@dataclass(frozen=True)
+class KeyEvent:
+    """Decoded board key bitmap.
+
+    Payload schema, matching the current AIKB firmware:
+
+    - byte 0: normal key bitmap, bits 0..7 map to :class:`BoardKey`
+    - byte 1 bit 0: encoder push switch
+    """
+
+    key_bits: int
+    encoder_pressed: bool
+
+    def pressed(self, key: BoardKey) -> bool:
+        return bool(self.key_bits & (1 << int(key)))
+
+
+def decode_key_event_payload(payload: bytes) -> KeyEvent:
+    if len(payload) < 2:
+        raise ProtocolError(f"KEY_EVENT payload shorter than 2 bytes: {len(payload)}")
+    return KeyEvent(
+        key_bits=payload[0] & 0xFF,
+        encoder_pressed=bool(payload[1] & 0x01),
+    )
+
+
+def encode_key_event_payload(key_bits: int, *, encoder_pressed: bool = False) -> bytes:
+    if not 0 <= key_bits <= 0xFF:
+        raise ProtocolError(f"key_bits out of range: {key_bits}")
+    return bytes([key_bits & 0xFF, 0x01 if encoder_pressed else 0x00])
+
+
+def decode_encoder_delta_payload(payload: bytes) -> int:
+    if len(payload) < 1:
+        raise ProtocolError("ENCODER_EVENT payload is empty")
+    delta = payload[0]
+    if delta > 127:
+        delta -= 256
+    return delta
 
 
 def make_request_session(
@@ -166,6 +220,33 @@ def make_error(session_id: int, message: str) -> Packet:
         command=int(Cmd.ERROR),
         session_id=session_id,
         payload=message.encode("utf-8")[:MAX_PAYLOAD_PER_FRAME],
+    )
+
+
+def make_key_event(
+    key_bits: int,
+    *,
+    encoder_pressed: bool = False,
+    session_id: int = SESSION_BROADCAST,
+) -> Packet:
+    return Packet(
+        report_id=int(ReportId.HOST_BOUND),
+        command=int(Cmd.KEY_EVENT),
+        session_id=session_id,
+        payload=encode_key_event_payload(key_bits, encoder_pressed=encoder_pressed),
+    )
+
+
+def make_encoder_event(delta: int, *, session_id: int = SESSION_BROADCAST) -> Packet:
+    if delta < -127:
+        delta = -127
+    if delta > 127:
+        delta = 127
+    return Packet(
+        report_id=int(ReportId.HOST_BOUND),
+        command=int(Cmd.ENCODER_EVENT),
+        session_id=session_id,
+        payload=bytes([(delta & 0xFF)]),
     )
 
 
