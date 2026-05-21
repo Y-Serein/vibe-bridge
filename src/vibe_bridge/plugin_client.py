@@ -29,6 +29,7 @@ from .mock_hid import DEFAULT_SOCK_PATH, MockHidClient
 from .transport import TransportClosed
 
 InvalidateCallback = Callable[[int, Status], None]
+PacketCallback = Callable[[Packet], None]
 ENV_SOCK_PATH = "VIBE_SOCK_PATH"
 
 
@@ -44,11 +45,13 @@ class PluginClient:
         sock_path: Optional[str] = None,
         auto_reacquire: bool = True,
         on_invalidate: Optional[InvalidateCallback] = None,
+        on_board_packet: Optional[PacketCallback] = None,
     ) -> None:
         self._plugin_name = plugin_name
         self._sock_path = sock_path or os.environ.get(ENV_SOCK_PATH, DEFAULT_SOCK_PATH)
         self._auto_reacquire = auto_reacquire
         self._on_invalidate = on_invalidate
+        self._on_board_packet = on_board_packet
 
         self._client: Optional[MockHidClient] = None
         self._reader: Optional[threading.Thread] = None
@@ -138,6 +141,9 @@ class PluginClient:
             raise PluginError("client not connected")
         self._client.send_packet(packet)
 
+    def set_board_packet_handler(self, callback: Optional[PacketCallback]) -> None:
+        self._on_board_packet = callback
+
     # ------------------------------------------------------------- internals
 
     def _reader_loop(self) -> None:
@@ -163,6 +169,10 @@ class PluginClient:
             return
         if pkt.command == int(Cmd.SESSION_INVALID):
             status = Status(pkt.payload[0]) if pkt.payload else Status.INVALID
+            with self._sid_lock:
+                current_sid = self._sid
+            if pkt.session_id not in (0, current_sid):
+                return
             with self._sid_cond:
                 self._sid = None
                 self._sid_cond.notify_all()
@@ -179,5 +189,10 @@ class PluginClient:
                 except OSError:
                     pass
             return
-        # KEY_EVENT, ENCODER_EVENT, WINDOW_SWITCH, etc. — leave for the plugin to
-        # subscribe to in a future iteration.
+        if pkt.command in (int(Cmd.KEY_EVENT), int(Cmd.ENCODER_EVENT)):
+            if self._on_board_packet is not None:
+                try:
+                    self._on_board_packet(pkt)
+                except Exception:
+                    pass
+            return

@@ -29,6 +29,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import queue
 import select
 import signal
 import struct
@@ -75,6 +76,7 @@ def run_with_pty(
     stdin_fd: Optional[int] = None,
     stdout_fd: Optional[int] = None,
     winsize: Optional[tuple[int, int]] = None,
+    injected_input: Optional["queue.Queue[bytes]"] = None,
 ) -> int:
     """Spawn ``argv`` under a PTY; tee output to stdout + ``on_output``.
 
@@ -136,7 +138,7 @@ def run_with_pty(
             saved_termios = termios.tcgetattr(in_fd)
             tty.setraw(in_fd)
 
-        _io_loop(master_fd, in_fd, out_fd, on_output)
+        _io_loop(master_fd, in_fd, out_fd, on_output, injected_input)
     finally:
         if saved_termios is not None:
             try:
@@ -167,13 +169,17 @@ def _io_loop(
     in_fd: int,
     out_fd: int,
     on_output: Optional[ChunkCallback],
+    injected_input: Optional["queue.Queue[bytes]"] = None,
 ) -> None:
     rlist: List[int] = [master_fd]
     if in_fd >= 0:
         rlist.append(in_fd)
     while True:
+        if injected_input is not None and not _drain_injected_input(master_fd, injected_input):
+            return
         try:
-            r, _, _ = select.select(rlist, [], [], 1.0)
+            timeout = 0.1 if injected_input is not None else 1.0
+            r, _, _ = select.select(rlist, [], [], timeout)
         except InterruptedError:
             continue
         except OSError as exc:
@@ -216,6 +222,20 @@ def _io_loop(
                 _write_all(master_fd, data)
             except OSError:
                 return
+
+
+def _drain_injected_input(master_fd: int, injected_input: "queue.Queue[bytes]") -> bool:
+    while True:
+        try:
+            data = injected_input.get_nowait()
+        except queue.Empty:
+            return True
+        if not data:
+            continue
+        try:
+            _write_all(master_fd, data)
+        except OSError:
+            return False
 
 
 def _write_all(fd: int, data: bytes) -> None:

@@ -16,6 +16,7 @@ import os
 import errno
 import threading
 import time
+import queue
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Optional, Tuple
@@ -25,12 +26,16 @@ from .hid_protocol import (
     Packet,
     ProtocolError,
     Status,
+    decode_encoder_delta_payload,
+    decode_key_event_payload,
     make_error,
+    make_session_heartbeat,
     make_session_invalid,
     make_session_response,
     stream_iter_packets,
     SESSION_BROADCAST,
 )
+from .agent_scanner import AgentScanner, DEFAULT_SCAN_INTERVAL_SECONDS
 from .mock_hid import ClientHandle, MockHidServer, DEFAULT_SOCK_PATH
 from .session_manager import SessionManager
 from .transport import Transport, TransportClosed
@@ -39,6 +44,10 @@ from .vt100_router import Vt100Router
 DEFAULT_STATE_PATH = "/tmp/vibe-bridge-state.json"
 DEFAULT_SCREEN_PATH = "/tmp/vibe-bridge-screen.out"
 DEFAULT_LOG_PATH = "/tmp/vibe-bridge-daemon.log"
+HID_TX_QUEUE_LIMIT = 4096
+# Board-side timeout is 30 s without a heartbeat; emit one every 10 s so a
+# single dropped packet doesn't flip a session to DISCONNECTED.
+SESSION_HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 log = logging.getLogger("vibe_bridge.daemon")
 
@@ -53,6 +62,10 @@ class DaemonConfig:
     reap_interval_seconds: float = 60.0
     hidraw_path: Optional[str] = None
     hid_transport: Optional[Transport] = None
+    hid_mode: str = "real-hidraw"
+    heartbeat_interval_seconds: float = SESSION_HEARTBEAT_INTERVAL_SECONDS
+    agent_scan_enabled: bool = True
+    agent_scan_interval_seconds: float = DEFAULT_SCAN_INTERVAL_SECONDS
 
 
 class Daemon:
@@ -78,13 +91,29 @@ class Daemon:
         self._hid: Optional[Transport] = None
         self._hid_lock = threading.Lock()
         self._hid_reader: Optional[threading.Thread] = None
+        self._hid_writer: Optional[threading.Thread] = None
+        self._hid_tx_queue: "queue.Queue[Optional[Packet]]" = queue.Queue(
+            maxsize=HID_TX_QUEUE_LIMIT
+        )
         self._pending_sessions: Deque[Tuple[ClientHandle, str]] = deque()
         self._pending_lock = threading.Lock()
+        # Board owns the picker / terminal view; host only learns which sid the
+        # user confirmed via CMD_SESSION_FOCUS. The VT100 stream gate uses this
+        # value (None = nothing focused → no bytes forwarded to the board).
+        self._focused_sid: Optional[int] = None
+        self._last_state_dump_ms = 0
+        self._last_board_input_monotonic = time.monotonic()
+        self._last_board_event = ""
+        self._last_board_event_seq = 0
+        self._last_board_event_ms = 0
+        self._last_board_tx = ""
 
         self.sessions.set_invalidation_callback(self._on_session_invalidate)
 
         self._stop = threading.Event()
         self._reaper: Optional[threading.Thread] = None
+        self._heartbeat: Optional[threading.Thread] = None
+        self._agent_scanner: Optional[AgentScanner] = None
 
     # ----------------------------------------------------------- lifecycle
 
@@ -97,21 +126,43 @@ class Daemon:
             target=self._reap_loop, name="vibe-bridge-reaper", daemon=True
         )
         self._reaper.start()
+        self._heartbeat = threading.Thread(
+            target=self._heartbeat_loop,
+            name="vibe-bridge-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat.start()
+        if self.config.agent_scan_enabled:
+            self._agent_scanner = AgentScanner(
+                sock_path=self.config.sock_path,
+                interval_seconds=self.config.agent_scan_interval_seconds,
+            )
+            self._agent_scanner.start()
         self._dump_state()
         log.info("daemon listening on %s", self.config.sock_path)
 
     def stop(self) -> None:
         self._stop.set()
+        if self._agent_scanner is not None:
+            self._agent_scanner.stop()
         self.server.stop()
         if self._hid is not None:
             try:
                 self._hid.close()
             except Exception:
                 pass
+        try:
+            self._hid_tx_queue.put_nowait(None)
+        except queue.Full:
+            pass
         if self._reaper is not None:
             self._reaper.join(timeout=1.0)
+        if self._heartbeat is not None:
+            self._heartbeat.join(timeout=1.0)
         if self._hid_reader is not None:
             self._hid_reader.join(timeout=1.0)
+        if self._hid_writer is not None:
+            self._hid_writer.join(timeout=1.0)
 
     def run_forever(self) -> None:
         self.start()
@@ -137,6 +188,10 @@ class Daemon:
 
         self.router.set_screen_sink(self._on_hid_screen_write)
         drained = self._drain_hid_startup_input()
+        self._hid_writer = threading.Thread(
+            target=self._hid_writer_loop, name="vibe-bridge-hidraw-writer", daemon=True
+        )
+        self._hid_writer.start()
         self._hid_reader = threading.Thread(
             target=self._hid_reader_loop, name="vibe-bridge-hidraw", daemon=True
         )
@@ -187,10 +242,6 @@ class Daemon:
             self._handle_vt100(packet, client)
         elif cmd == Cmd.STATUS_UPDATE:
             self._handle_status_update(packet, client)
-        elif cmd == Cmd.WINDOW_ACTIVATE:
-            self._handle_window_activate(packet, client)
-        elif cmd == Cmd.WINDOW_SWITCH:
-            self._handle_window_switch(packet, client)
         else:
             log.info("ignoring cmd %s sid %d (%d bytes)", cmd.name, packet.session_id, len(packet.payload))
 
@@ -211,12 +262,9 @@ class Daemon:
                 self._forward_packet_to_board(packet)
             return
 
-        if cmd == Cmd.WINDOW_ACTIVATE:
-            self._handle_window_activate(packet, client)
-            return
-
-        if cmd == Cmd.WINDOW_SWITCH:
-            self._handle_window_switch(packet, client)
+        if cmd in (Cmd.WINDOW_ACTIVATE, Cmd.WINDOW_SWITCH):
+            # Deprecated: host can no longer drive board view transitions.
+            log.info("dropping deprecated %s from plugin sid=%d", cmd.name, packet.session_id)
             return
 
         if packet.session_id != SESSION_BROADCAST and not self._validate_session(packet, client):
@@ -225,10 +273,10 @@ class Daemon:
 
     def _forward_session_request_to_board(self, packet: Packet, client: ClientHandle) -> None:
         plugin_hint = packet.payload.decode("utf-8", errors="replace") or "unknown"
+        with self._pending_lock:
+            self._pending_sessions.append((client, plugin_hint))
         try:
-            with self._pending_lock:
-                self._pending_sessions.append((client, plugin_hint))
-                self._forward_packet_to_board(packet)
+            self._forward_packet_to_board(packet)
         except Exception as exc:
             self._drop_pending_session(client, plugin_hint)
             log.warning("failed to forward session request for %s: %s", plugin_hint, exc)
@@ -263,6 +311,7 @@ class Daemon:
             return
         self.sessions.touch(packet.session_id)
         self.router.append(packet.session_id, packet.payload)
+        self._dump_state_throttled()
 
     def _handle_status_update(self, packet: Packet, client: ClientHandle) -> None:
         if not self._validate_session(packet, client):
@@ -277,35 +326,6 @@ class Daemon:
         sess.context.update(update if isinstance(update, dict) else {"value": update})
         self.sessions.touch(packet.session_id)
         self._dump_state()
-
-    def _handle_window_activate(self, packet: Packet, client: ClientHandle) -> None:
-        if not self._validate_session(packet, client):
-            return
-        if self.router.set_active(packet.session_id):
-            log.info("active window -> sid %d", packet.session_id)
-            self._dump_state()
-
-    def _handle_window_switch(self, packet: Packet, client: ClientHandle) -> None:
-        # Convention: payload[0] is a signed delta (-1 prev, +1 next, 0 = none).
-        delta = 0
-        if packet.payload:
-            delta = packet.payload[0]
-            if delta > 127:
-                delta -= 256
-        new_sid = self._switch_window_by_delta(delta)
-        if new_sid is not None:
-            log.info("window switch delta=%d -> sid %d", delta, new_sid)
-            self._dump_state()
-
-    def _switch_window_by_delta(self, delta: int) -> Optional[int]:
-        sids = [s.sid for s in self.sessions.all_sessions()]
-        if not sids:
-            return None
-        active = self.router.active()
-        idx = sids.index(active) if active in sids else 0
-        new_idx = (idx + delta) % len(sids)
-        self.router.set_active(sids[new_idx])
-        return sids[new_idx]
 
     # --------------------------------------------------------- bookkeeping
 
@@ -335,6 +355,32 @@ class Daemon:
                 continue
             self._handle_hid_packet(pkt)
 
+    def _hid_writer_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                packet = self._hid_tx_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if packet is None:
+                return
+            with self._hid_lock:
+                hid = self._hid
+            if hid is None:
+                continue
+            try:
+                hid.send_packet(packet)
+            except TransportClosed as exc:
+                log.warning("hidraw write closed: %s", exc)
+                self._mark_hidraw_unavailable()
+                return
+            except OSError as exc:
+                log.warning("hidraw write error: %s", exc)
+                self._mark_hidraw_unavailable()
+                return
+            except ProtocolError as exc:
+                log.warning("hidraw write error: %s", exc)
+                continue
+
     def _mark_hidraw_unavailable(self) -> None:
         with self._hid_lock:
             hid = self._hid
@@ -345,6 +391,11 @@ class Daemon:
                 hid.close()
             except Exception:
                 pass
+        try:
+            self._hid_tx_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._fail_pending_sessions(Status.INVALID)
         self._dump_state()
 
     def _handle_hid_packet(self, packet: Packet) -> None:
@@ -358,8 +409,10 @@ class Daemon:
             self._handle_hid_session_response(packet)
         elif cmd == Cmd.SESSION_INVALID:
             self._handle_hid_session_invalid(packet)
+        elif cmd == Cmd.SESSION_FOCUS:
+            self._handle_hid_session_focus(packet)
         elif cmd == Cmd.KEY_EVENT:
-            self._route_board_input_to_active(packet)
+            self._handle_hid_key_event(packet)
         elif cmd == Cmd.ENCODER_EVENT:
             self._handle_hid_encoder_event(packet)
         else:
@@ -380,9 +433,14 @@ class Daemon:
         if status in (Status.OK, Status.CREATED) and packet.session_id != SESSION_BROADCAST:
             sid, local_status, _ = self.sessions.adopt_session(packet.session_id, plugin_hint)
             if local_status in (Status.CREATED, Status.OK) and sid == packet.session_id:
+                old_sids = self._sessions_owned_by(client, except_sid=sid)
                 with self._owners_lock:
+                    for old_sid in old_sids:
+                        self._owners.pop(old_sid, None)
                     self._owners[sid] = client
                 self.router.register(sid)
+                for old_sid in old_sids:
+                    self.sessions.invalidate(old_sid, Status.RECLAIMED)
                 log.info("board granted sid=%d to %s (status=%s)", sid, plugin_hint, status.name)
                 self._dump_state()
             else:
@@ -426,34 +484,73 @@ class Daemon:
             return
         self.sessions.invalidate(packet.session_id, status)
 
-    def _handle_hid_encoder_event(self, packet: Packet) -> None:
-        delta = 0
-        if packet.payload:
-            delta = packet.payload[0]
-            if delta > 127:
-                delta -= 256
-        new_sid = self._switch_window_by_delta(delta)
-        if new_sid is not None:
-            log.info("board encoder delta=%d -> sid %d", delta, new_sid)
+    def _handle_hid_session_focus(self, packet: Packet) -> None:
+        """Board user picked ``packet.session_id``. Open the VT100 gate so the
+        active session's bytes start flowing toward the LCD."""
+        sid = packet.session_id
+        if sid == SESSION_BROADCAST:
+            # Treat sid=0 as "unfocus" — board left the terminal view.
+            self._focused_sid = None
+            self.router.set_active(None)
+            log.info("board cleared focus")
             self._dump_state()
-        self._route_board_input_to_active(packet)
+            return
+        if self.sessions.get(sid) is None:
+            log.info("board focused unknown sid %d; ignoring", sid)
+            return
+        self._focused_sid = sid
+        self.sessions.touch(sid)
+        # router.set_active flushes a screen-clear + the per-sid replay so the
+        # board's terminal lights up with the latest state for this window.
+        self.router.set_active(sid)
+        log.info("board focused sid=%d", sid)
+        self._dump_state()
 
-    def _route_board_input_to_active(self, packet: Packet) -> None:
-        active = self.router.active()
-        if active is None:
+    def _handle_hid_key_event(self, packet: Packet) -> None:
+        """Board → host key event. Per the new contract the board owns its own
+        UI, so the daemon's only job is to forward the event to the plugin that
+        owns the (board-stamped) sid."""
+        self._mark_board_interaction()
+        try:
+            event = decode_key_event_payload(packet.payload)
+        except ProtocolError as exc:
+            log.info("dropping invalid KEY_EVENT: %s", exc)
+            self._record_board_event(f"invalid-key:{exc}")
+            return
+        self._record_board_event(
+            f"key bits=0x{event.key_bits:02x} enc={1 if event.encoder_pressed else 0} sid={packet.session_id}"
+        )
+        self._route_board_input_to_session(packet)
+
+    def _handle_hid_encoder_event(self, packet: Packet) -> None:
+        self._mark_board_interaction()
+        try:
+            delta = decode_encoder_delta_payload(packet.payload)
+        except ProtocolError as exc:
+            log.info("dropping invalid ENCODER_EVENT: %s", exc)
+            self._record_board_event(f"invalid-encoder:{exc}")
+            return
+        self._record_board_event(f"encoder delta={delta} sid={packet.session_id}")
+        self._route_board_input_to_session(packet)
+
+    def _route_board_input_to_session(self, packet: Packet) -> None:
+        """Deliver a board-stamped KEY/ENCODER event to the plugin owning that sid.
+
+        ``aikb_hid_input`` only emits these packets while the board is in the
+        terminal view, so the daemon trusts the firmware-stamped sid and does
+        not try to second-guess it.
+        """
+        sid = packet.session_id
+        if sid == SESSION_BROADCAST:
+            log.info("dropping board %s with sid=0", Cmd(packet.command).name)
             return
         with self._owners_lock:
-            owner = self._owners.get(active)
+            owner = self._owners.get(sid)
         if owner is None:
+            log.info("dropping board %s sid=%d (no owner)", Cmd(packet.command).name, sid)
             return
-        routed = Packet(
-            report_id=packet.report_id,
-            command=packet.command,
-            session_id=active,
-            payload=packet.payload,
-        )
         try:
-            owner.send(routed)
+            owner.send(packet)
         except Exception:
             pass
 
@@ -472,15 +569,53 @@ class Daemon:
             pass
 
     def _on_hid_screen_write(self, sid: int, data: bytes) -> None:
-        for pkt in stream_iter_packets(sid, data):
-            self._forward_packet_to_board(pkt)
+        """VT100 sink invoked by ``Vt100Router`` whenever the active sid's
+        buffer grows. The router only triggers for the focused sid, which is
+        exactly what we want — host stops streaming for any window the board
+        has not selected."""
+        if self._focused_sid is None or sid != self._focused_sid:
+            return
+        if self._hid is None:
+            return
+        try:
+            for pkt in stream_iter_packets(sid, data):
+                self._forward_packet_to_board(pkt)
+        except Exception as exc:
+            log.info("hidraw screen write dropped: %s", exc)
 
     def _forward_packet_to_board(self, packet: Packet) -> None:
-        hid = self._hid
+        with self._hid_lock:
+            hid = self._hid
         if hid is None:
             raise TransportClosed("hidraw bridge is not enabled")
-        with self._hid_lock:
-            hid.send_packet(packet)
+        self._last_board_tx = (
+            f"cmd=0x{int(packet.command):02x} sid={packet.session_id} len={len(packet.payload)}"
+        )
+        self._dump_state_throttled()
+        try:
+            self._hid_tx_queue.put_nowait(packet)
+        except queue.Full as exc:
+            log.warning("hidraw tx queue full; marking device unavailable")
+            self._mark_hidraw_unavailable()
+            raise TransportClosed("hidraw tx queue full") from exc
+
+    def _mark_board_interaction(self) -> None:
+        self._last_board_input_monotonic = time.monotonic()
+
+    def _record_board_event(self, event: str) -> None:
+        self._last_board_event = event
+        self._last_board_event_seq += 1
+        self._last_board_event_ms = int(time.time() * 1000)
+        self._dump_state_throttled()
+
+    def _sessions_owned_by(
+        self, client: ClientHandle, *, except_sid: Optional[int] = None
+    ) -> list[int]:
+        with self._owners_lock:
+            return [
+                sid for sid, owner in self._owners.items()
+                if owner is client and sid != except_sid
+            ]
 
     def _pop_pending_session(self) -> Optional[Tuple[ClientHandle, str]]:
         with self._pending_lock:
@@ -493,6 +628,16 @@ class Daemon:
             try:
                 self._pending_sessions.remove((client, plugin_hint))
             except ValueError:
+                pass
+
+    def _fail_pending_sessions(self, status: Status) -> None:
+        with self._pending_lock:
+            pending = list(self._pending_sessions)
+            self._pending_sessions.clear()
+        for client, _ in pending:
+            try:
+                client.send(make_session_invalid(SESSION_BROADCAST, status))
+            except Exception:
                 pass
 
     @staticmethod
@@ -532,6 +677,8 @@ class Daemon:
                 owner.send(make_session_invalid(sid, status))
             except Exception:
                 pass
+        if self._focused_sid == sid:
+            self._focused_sid = None
         log.info("session %d invalidated (%s)", sid, status.name)
         self._dump_state()
 
@@ -556,14 +703,45 @@ class Daemon:
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(timeout=self.config.reap_interval_seconds):
-            self.sessions.reap_expired()
+            expired = self.sessions.reap_expired()
+            if expired:
+                log.info("reaped expired sessions: %s", expired)
+                self._dump_state()
+
+    def _heartbeat_loop(self) -> None:
+        """Emit CMD_SESSION_HEARTBEAT every ``heartbeat_interval_seconds`` for
+        every live session. Without this, the board's 30 s reaper flips every
+        session to DISCONNECTED and the VT100 stream gate slams shut."""
+        while True:
+            interval = max(0.01, float(self.config.heartbeat_interval_seconds))
+            if self._stop.wait(timeout=interval):
+                return
+            if self._hid is None:
+                continue
+            for sess in self.sessions.all_sessions():
+                pkt = make_session_heartbeat(sess.sid)
+                try:
+                    self._forward_packet_to_board(pkt)
+                except TransportClosed:
+                    # hidraw went away; the writer loop will mark it.
+                    break
+                except Exception as exc:
+                    log.info("heartbeat for sid=%d failed: %s", sess.sid, exc)
 
     def _dump_state(self) -> None:
+        hooked_agents = (
+            self._agent_scanner.hook_table() if self._agent_scanner is not None else []
+        )
         state = {
             "sock_path": self.config.sock_path,
-            "mode": "real-hidraw" if self._hid is not None else "mock",
+            "mode": self.config.hid_mode if self._hid is not None else "mock",
             "hidraw_path": self.config.hidraw_path,
-            "active_sid": self.router.active(),
+            "focused_sid": self._focused_sid,
+            "hooked_agents": hooked_agents,
+            "last_board_event": self._last_board_event,
+            "last_board_event_seq": self._last_board_event_seq,
+            "last_board_event_ms": self._last_board_event_ms,
+            "last_board_tx": self._last_board_tx,
             "sessions": [
                 {
                     "sid": s.sid,
@@ -587,6 +765,13 @@ class Daemon:
                 os.replace(tmp, path)
             except OSError as exc:
                 log.warning("failed to write state %s: %s", path, exc)
+
+    def _dump_state_throttled(self, *, min_interval_ms: int = 250) -> None:
+        now = int(time.time() * 1000)
+        if now - self._last_state_dump_ms < min_interval_ms:
+            return
+        self._last_state_dump_ms = now
+        self._dump_state()
 
     @staticmethod
     def _truncate(path: str) -> None:

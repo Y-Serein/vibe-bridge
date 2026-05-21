@@ -8,15 +8,20 @@ from vibe_bridge.hid_protocol import (
     Packet,
     ProtocolError,
     ReportId,
+    SessionState,
     Status,
     decode_encoder_delta_payload,
     decode_key_event_payload,
+    decode_status_update_payload,
     encode_key_event_payload,
     fragment_payload,
     make_encoder_event,
     make_key_event,
     make_request_session,
+    make_session_focus,
+    make_session_heartbeat,
     make_session_response,
+    make_status_update,
     make_vt100_chunk,
     stream_iter_packets,
 )
@@ -130,6 +135,35 @@ class FragmentationTests(unittest.TestCase):
             self.assertEqual(pkt.session_id, 42)
             self.assertIs(pkt.cmd(), Cmd.VT100_STREAM)
         self.assertEqual(pkts[0].payload + pkts[1].payload, payload)
+
+
+class SessionLifecycleHelpersTests(unittest.TestCase):
+    def test_session_heartbeat_uses_device_bound_empty_payload(self):
+        pkt = make_session_heartbeat(7)
+        self.assertEqual(pkt.report_id, int(ReportId.DEVICE_BOUND))
+        self.assertEqual(pkt.command, int(Cmd.SESSION_HEARTBEAT))
+        self.assertEqual(pkt.session_id, 7)
+        self.assertEqual(pkt.payload, b"")
+
+    def test_session_focus_uses_host_bound_empty_payload(self):
+        pkt = make_session_focus(42)
+        self.assertEqual(pkt.report_id, int(ReportId.HOST_BOUND))
+        self.assertEqual(pkt.command, int(Cmd.SESSION_FOCUS))
+        self.assertEqual(pkt.session_id, 42)
+        self.assertEqual(pkt.payload, b"")
+
+    def test_status_update_carries_state_byte(self):
+        pkt = make_status_update(9, SessionState.WAIT)
+        self.assertEqual(pkt.command, int(Cmd.STATUS_UPDATE))
+        self.assertEqual(pkt.session_id, 9)
+        self.assertEqual(pkt.payload, bytes([int(SessionState.WAIT)]))
+        self.assertEqual(decode_status_update_payload(pkt.payload), SessionState.WAIT)
+
+    def test_decode_status_update_rejects_empty_and_unknown(self):
+        with self.assertRaises(ProtocolError):
+            decode_status_update_payload(b"")
+        with self.assertRaises(ProtocolError):
+            decode_status_update_payload(bytes([0xFE]))
 
 
 if __name__ == "__main__":

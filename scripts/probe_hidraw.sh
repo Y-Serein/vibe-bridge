@@ -29,9 +29,14 @@
 set -u
 
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DEVICE="${1:-/dev/hidraw0}"
 
 cd "$REPO_DIR"
+
+DEVICE="${1:-}"
+if [ -z "$DEVICE" ]; then
+    DEVICE="$(PYTHONPATH=src python3 -m vibe_bridge.main hid list 2>/dev/null \
+        | awk '$2 == "359f:2120" {print $1; exit}')"
+fi
 
 echo "============================================================"
 echo "  vibe-bridge real-HID probe"
@@ -49,8 +54,8 @@ echo "--- /dev/hidraw* permissions ---"
 ls -l /dev/hidraw* 2>&1 || true
 echo
 
-if [ ! -e "$DEVICE" ]; then
-    echo "DEVICE $DEVICE does not exist; aborting probe/handshake."
+if [ -z "$DEVICE" ] || [ ! -e "$DEVICE" ]; then
+    echo "Vibe 359f:2120 hidraw device not found; aborting probe/handshake."
     echo "Reattach via:  usbipd attach --wsl --busid 8-1   (Windows host)"
     exit 1
 fi

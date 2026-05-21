@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import codecs
 import os
+import queue
 import re
 import sys
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from .bootstrap import (
     DEFAULT_STATE_PATH,
@@ -35,7 +36,15 @@ from .bootstrap import (
     resolve_hidraw_device,
 )
 from .forwarder import Forwarder
-from .hid_protocol import Cmd, Packet, ReportId
+from .hid_protocol import (
+    BoardKey,
+    Cmd,
+    Packet,
+    ProtocolError,
+    ReportId,
+    decode_encoder_delta_payload,
+    decode_key_event_payload,
+)
 from .mock_hid import DEFAULT_SOCK_PATH
 from .plugin_client import PluginClient, PluginError
 
@@ -48,10 +57,16 @@ ENV_LCD_COLS = "VIBE_BRIDGE_LCD_COLS"
 ENV_LCD_ROWS = "VIBE_BRIDGE_LCD_ROWS"
 ENV_LCD_CHAR_ADAPT = "VIBE_BRIDGE_LCD_CHAR_ADAPT"
 ENV_LCD_THEME = "VIBE_BRIDGE_LCD_THEME"
+ENV_BOARD_ACTIONS = "VIBE_BRIDGE_BOARD_ACTIONS"
+ENV_ALLOW_MOCK = "VIBE_BRIDGE_ALLOW_MOCK"
 LEGACY_REAL_SOCK_PATH = "/tmp/vibe-real.sock"
 LEGACY_REAL_STATE_PATH = "/tmp/vibe-real-state.json"
 DEFAULT_LCD_COLS = 78
 DEFAULT_LCD_ROWS = 15
+KEY_ENTER = b"\r"
+KEY_CTRL_C = b"\x03"
+KEY_UP = b"\x1b[A"
+KEY_DOWN = b"\x1b[B"
 TABLE_SEP_CELL_RE = re.compile(r"^:?-{3,}:?$")
 SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
 ANSI_RE = re.compile(r"\x1b\[[?0-9;:]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[_PX^].*?\x1b\\", re.DOTALL)
@@ -165,6 +180,69 @@ GRUVBOX_ANSI = {
     14: (142, 192, 124),  # bright_aqua
     15: (235, 219, 178),  # light1
 }
+
+class BoardActionHandler:
+    """Translate board HID input into PTY input or daemon window commands."""
+
+    def __init__(
+        self,
+        *,
+        plugin: PluginClient,
+        inject_input: Callable[[bytes], None],
+    ) -> None:
+        self._plugin = plugin
+        self._inject_input = inject_input
+
+    def handle_packet(self, packet: Packet) -> None:
+        try:
+            cmd = Cmd(packet.command)
+        except ValueError:
+            return
+        if cmd == Cmd.KEY_EVENT:
+            self._handle_key_event(packet)
+        elif cmd == Cmd.ENCODER_EVENT:
+            self._handle_encoder_event(packet)
+
+    def _handle_key_event(self, packet: Packet) -> None:
+        try:
+            event = decode_key_event_payload(packet.payload)
+        except ProtocolError:
+            return
+        if event.pressed(BoardKey.REJECT):
+            self._inject_input(KEY_CTRL_C)
+            return
+        if event.pressed(BoardKey.SESSION):
+            self._send_window_switch(1)
+            return
+        if event.pressed(BoardKey.CONFIRM) or event.encoder_pressed:
+            self._inject_input(KEY_ENTER)
+            return
+        # Product rule: these keys provide board-local video feedback for now.
+        # They must not write synthetic text into the active Codex/Claude input.
+
+    def _handle_encoder_event(self, packet: Packet) -> None:
+        try:
+            decode_encoder_delta_payload(packet.payload)
+        except ProtocolError:
+            return
+        return
+
+    def _send_window_switch(self, delta: int) -> None:
+        if delta < -127:
+            delta = -127
+        if delta > 127:
+            delta = 127
+        try:
+            self._plugin.send_packet(
+                Packet(
+                    report_id=int(ReportId.HOST_BOUND),
+                    command=int(Cmd.WINDOW_SWITCH),
+                    session_id=self._plugin.session_id or 0,
+                    payload=bytes([delta & 0xFF]),
+                )
+            )
+        except Exception:
+            pass
 
 
 class LcdOutputAdapter:
@@ -655,6 +733,10 @@ def run(
 
     env = dict(os.environ)
     env[ENV_SOCK_PATH] = sock_path
+    # The wrapper owns the bridge session for this top-level CLI.  Keep any
+    # subprocess that resolves `codex`/`claude` through PATH from recursively
+    # entering the wrapper and allocating extra board sessions.
+    env[ENV_DISABLE] = "1"
     if session_id is not None:
         env[ENV_SESSION_ID] = str(session_id)
     if mode == "pty":
@@ -691,6 +773,13 @@ def _run_pty(
     forwarder = Forwarder(plugin.send_vt100)
     forwarder.start()
     adapter = _lcd_output_adapter_from_env()
+    injected_input: "queue.Queue[bytes]" = queue.Queue()
+    if _board_actions_enabled():
+        action_handler = BoardActionHandler(
+            plugin=plugin,
+            inject_input=injected_input.put,
+        )
+        plugin.set_board_packet_handler(action_handler.handle_packet)
 
     def on_output(chunk: bytes) -> None:
         forwarder.push(adapter.feed(chunk) if adapter is not None else chunk)
@@ -702,8 +791,10 @@ def _run_pty(
             env=env,
             on_output=on_output,
             winsize=_lcd_pty_size(),
+            injected_input=injected_input,
         )
     finally:
+        plugin.set_board_packet_handler(None)
         forwarder.stop(timeout=0.5)
         plugin.close()
 
@@ -711,7 +802,14 @@ def _run_pty(
 def _open_session_client(
     plugin_name: str, sock_path: str
 ) -> Tuple[Optional[PluginClient], Optional[int]]:
-    if not ensure_daemon_running(sock_path, timeout=3.0):
+    if resolve_hidraw_device() is None and os.environ.get(ENV_ALLOW_MOCK) != "1":
+        print(
+            "vibe-bridge wrapper: no Vibe HID detected, running without session",
+            file=sys.stderr,
+        )
+        return None, None
+
+    if not ensure_daemon_running(sock_path, timeout=1.0):
         print(
             "vibe-bridge wrapper: daemon unreachable, running without session",
             file=sys.stderr,
@@ -721,7 +819,11 @@ def _open_session_client(
     existing = _existing_session_from_env()
     if existing is not None:
         try:
-            plugin = PluginClient(plugin_name=plugin_name, sock_path=sock_path)
+            plugin = PluginClient(
+                plugin_name=plugin_name,
+                sock_path=sock_path,
+                auto_reacquire=False,
+            )
             plugin.adopt_session(existing)
             plugin.connect()
             _activate_session(plugin, existing)
@@ -731,9 +833,13 @@ def _open_session_client(
 
     plugin: Optional[PluginClient] = None
     try:
-        plugin = PluginClient(plugin_name=plugin_name, sock_path=sock_path)
+        plugin = PluginClient(
+            plugin_name=plugin_name,
+            sock_path=sock_path,
+            auto_reacquire=False,
+        )
         plugin.connect()
-        sid = plugin.acquire_session(timeout=2.0)
+        sid = plugin.acquire_session(timeout=1.0)
         _activate_session(plugin, sid)
         return plugin, sid
     except (PluginError, OSError) as exc:
@@ -759,6 +865,11 @@ def _activate_session(plugin: PluginClient, sid: int) -> None:
         )
     except Exception:
         pass
+
+
+def _board_actions_enabled() -> bool:
+    value = os.environ.get(ENV_BOARD_ACTIONS, "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _exec_real(plugin_name: str, argv: List[str], self_paths: List[str]) -> int:

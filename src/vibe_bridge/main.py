@@ -6,11 +6,19 @@ import argparse
 import json
 import logging
 import os
+import shutil
+import socket
 import sys
 import time
 from typing import Optional
 
-from .bootstrap import can_connect
+from .bootstrap import (
+    VIBE_USB_PID,
+    VIBE_USB_VID,
+    can_connect,
+    ensure_daemon_running,
+    resolve_hidraw_device,
+)
 from .daemon import Daemon, DaemonConfig, DEFAULT_STATE_PATH
 from .hid_protocol import (
     Cmd,
@@ -24,6 +32,7 @@ from .hid_protocol import (
     stream_iter_packets,
 )
 from .mock_hid import MockHidClient, DEFAULT_SOCK_PATH
+from .mock_hid import connect_packet_socket, is_tcp_endpoint
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,6 +50,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--hidraw",
         default=None,
         help="Bridge to a real /dev/hidraw* device; session ids remain board-assigned",
+    )
+    pd.add_argument(
+        "--winhid",
+        default=None,
+        help="Bridge to a native Windows HID device path; use 'auto' to select 359f:2120",
+    )
+
+    ped = sub.add_parser(
+        "ensure-daemon",
+        help="Start a detached daemon if needed, then report socket/log status",
+    )
+    ped.add_argument("--state", default=DEFAULT_STATE_PATH)
+    ped.add_argument("--log", default="/tmp/vibe-bridge-daemon.log")
+    ped.add_argument("--timeout", type=float, default=3.0)
+
+    pdoc = sub.add_parser("doctor", help="Check host install, daemon, HID, and wrapper health")
+    pdoc.add_argument("--state", default=DEFAULT_STATE_PATH)
+    pdoc.add_argument("--log", default="/tmp/vibe-bridge-daemon.log")
+    pdoc.add_argument("--cli", action="append", default=None,
+                      help="CLI wrapper name to check; may be passed multiple times")
+    pdoc.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Colorize doctor status labels (default: %(default)s)",
     )
 
     ps = sub.add_parser("sessions", help="Print the daemon session table (reads state file)")
@@ -78,6 +112,37 @@ def _build_parser() -> argparse.ArgumentParser:
     pus.add_argument("--cell-h", type=int, required=True,
                      help="Terminal cell height in pixels (e.g. 16/20/24/32)")
 
+    pw = sub.add_parser("windows", help="Windows native product-mode tools")
+    wsub = pw.add_subparsers(dest="windows_cmd", required=True)
+    wsub.add_parser("doctor", help="Check native Windows product-mode readiness")
+    wsub.add_parser("plan", help="Print the Windows session adapter plan")
+    pwd = wsub.add_parser("daemon", help="Run Windows product daemon on loopback TCP")
+    pwd.add_argument("--state", default=None)
+    pwd.add_argument("--screen", default=None)
+    pwd.add_argument("--host", default="127.0.0.1")
+    pwd.add_argument("--port", type=int, default=8765)
+    pwd.add_argument(
+        "--device",
+        default="auto",
+        help="Windows HID device path, 'auto', or 'none' for IPC-only development",
+    )
+    pwc = wsub.add_parser("cli", help="Run a Windows CLI under ConPTY and register a session")
+    pwc.add_argument("--plugin", default=None, help="Session/plugin label (default: command basename)")
+    pwc.add_argument("--ipc", default="tcp://127.0.0.1:8765", help="Windows daemon IPC endpoint")
+    pwc.add_argument("argv", nargs=argparse.REMAINDER, help="Command to run, e.g. codex")
+
+    pww = wsub.add_parser("wsl-cli", help="Run wsl.exe under ConPTY and register a session")
+    pww.add_argument("--plugin", default="wsl-cli", help="Session/plugin label")
+    pww.add_argument("--ipc", default="tcp://127.0.0.1:8765", help="Windows daemon IPC endpoint")
+    pww.add_argument("--distro", default=None, help="WSL distribution name passed to wsl.exe -d")
+    pww.add_argument("--wsl-cwd", default=None, help="Directory passed to wsl.exe --cd")
+    pww.add_argument("argv", nargs=argparse.REMAINDER, help="Command after wsl.exe --, e.g. codex")
+
+    pwr = wsub.add_parser("run", help="Compatibility alias for `windows cli`")
+    pwr.add_argument("--plugin", default=None, help="Session/plugin label (default: command basename)")
+    pwr.add_argument("--ipc", default="tcp://127.0.0.1:8765", help="Windows daemon IPC endpoint")
+    pwr.add_argument("argv", nargs=argparse.REMAINDER, help="Command to run, e.g. codex")
+
     ph = sub.add_parser("hid", help="Real /dev/hidraw* probing tools")
     hsub = ph.add_subparsers(dest="hid_cmd", required=True)
 
@@ -108,16 +173,215 @@ def _setup_logging(verbose: int) -> None:
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
+    hid_transport = None
+    hid_path = args.hidraw
+    if args.winhid is not None:
+        if args.hidraw is not None:
+            print("daemon: --hidraw and --winhid are mutually exclusive", file=sys.stderr)
+            return 2
+        from .transport_win_hid import WinHidTransport, resolve_win_hid_device
+
+        hid_path = resolve_win_hid_device() if args.winhid == "auto" else args.winhid
+        if not hid_path:
+            print("daemon: no Windows Vibe HID device found", file=sys.stderr)
+            return 1
+        hid_transport = WinHidTransport(hid_path)
     cfg = DaemonConfig(
         sock_path=args.sock,
         state_path=args.state,
         max_sessions=args.max_sessions,
-        hidraw_path=args.hidraw,
+        hidraw_path=hid_path,
+        hid_transport=hid_transport,
+        hid_mode="real-winhid" if args.winhid is not None else "real-hidraw",
     )
     if args.screen is not None:
         cfg.screen_path = args.screen
     daemon = Daemon(cfg)
     daemon.run_forever()
+    return 0
+
+
+def cmd_ensure_daemon(args: argparse.Namespace) -> int:
+    ok = ensure_daemon_running(
+        args.sock,
+        state_path=args.state,
+        timeout=args.timeout,
+        log_path=args.log,
+    )
+    if not os.path.exists(args.log):
+        open(args.log, "ab").close()
+    print(f"daemon socket : {args.sock}")
+    print(f"socket status : {'reachable' if ok else 'unreachable'}")
+    print(f"daemon log    : {args.log}")
+    return 0 if ok else 1
+
+
+def _load_state(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _find_cli_behind_wrapper(name: str, wrapper_real: str) -> Optional[str]:
+    seen = set()
+    for raw in os.environ.get("PATH", "").split(os.pathsep):
+        directory = os.path.expanduser(raw) if raw else "."
+        if directory in seen:
+            continue
+        seen.add(directory)
+        candidate = os.path.join(directory, name)
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        if os.path.realpath(candidate) == wrapper_real:
+            continue
+        return candidate
+    return None
+
+
+def _probe_socket(sock_path: str, *, timeout: float = 0.2) -> tuple[bool, Optional[str]]:
+    if not is_tcp_endpoint(sock_path) and not os.path.exists(sock_path):
+        return False, "socket file is missing"
+    s: Optional[socket.socket] = None
+    try:
+        s = connect_packet_socket(sock_path, timeout=timeout)
+        return True, None
+    except PermissionError as exc:
+        return False, f"permission denied while probing socket: {exc}"
+    except (OSError, socket.timeout) as exc:
+        return False, str(exc)
+    finally:
+        if s is not None:
+            s.close()
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    fail = 0
+    use_color = args.color == "always" or (
+        args.color == "auto"
+        and sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+    )
+    colors = {
+        "OK": "\033[32m",
+        "WARN": "\033[33m",
+        "FAIL": "\033[31m",
+        "RESET": "\033[0m",
+    }
+
+    def line(status: str, message: str) -> None:
+        nonlocal fail
+        label = f"[{status}]"
+        if use_color:
+            label = f"{colors[status]}{label}{colors['RESET']}"
+        print(f"{label} {message}")
+        if status == "FAIL":
+            fail += 1
+
+    print("vibe-bridge doctor")
+    print()
+
+    state = _load_state(args.state)
+    state_sock = args.sock
+    if state is not None and isinstance(state.get("sock_path"), str):
+        state_sock = state["sock_path"]
+    socket_ok, socket_reason = _probe_socket(state_sock)
+    if socket_ok:
+        line("OK", f"daemon socket reachable: {state_sock}")
+    else:
+        detail = f" ({socket_reason})" if socket_reason else ""
+        line("WARN", f"daemon socket not reachable: {state_sock}{detail}")
+        line("OK", "recovery command: python3 -m vibe_bridge.main ensure-daemon")
+
+    if state is None:
+        line("WARN", f"state file missing or unreadable: {args.state}")
+    else:
+        mode = state.get("mode") or "unknown"
+        sock_path = state.get("sock_path") or args.sock
+        line("OK", f"state file readable: mode={mode} sock={sock_path}")
+        try:
+            age = max(0.0, time.time() - os.path.getmtime(args.state))
+            if age > 30.0 and not socket_ok:
+                line("WARN", f"state is stale: age={age:.1f}s")
+            else:
+                line("OK", f"state age: {age:.1f}s")
+        except OSError:
+            pass
+        hidraw_path = state.get("hidraw_path")
+        if hidraw_path:
+            if os.path.exists(str(hidraw_path)):
+                line("OK", f"daemon hidraw path exists: {hidraw_path}")
+            else:
+                line("FAIL", f"daemon hidraw path is gone: {hidraw_path}")
+
+    try:
+        from .transport_hidraw import list_hidraw_devices
+
+        devices = list_hidraw_devices()
+    except Exception as exc:
+        devices = []
+        line("WARN", f"hidraw enumeration failed: {exc}")
+
+    expected = f"{VIBE_USB_VID:04x}:{VIBE_USB_PID:04x}"
+    vibe_devices = [d for d in devices if d.vid == VIBE_USB_VID and d.pid == VIBE_USB_PID]
+    if vibe_devices:
+        for d in vibe_devices:
+            rw = "rw" if d.readable and d.writable else (
+                ("r" if d.readable else "-") + ("w" if d.writable else "-")
+            )
+            status = "OK" if d.readable and d.writable else "FAIL"
+            line(status, f"Vibe HID {expected} at {d.path} permissions={rw}")
+    else:
+        line("WARN", f"no Vibe HID device ({expected}) detected")
+
+    auto_hid = resolve_hidraw_device()
+    if auto_hid:
+        line("OK", f"automatic hidraw selection: {auto_hid}")
+    else:
+        line("OK", "automatic hidraw selection is disabled until a Vibe VID:PID is present")
+
+    other_hid = [d for d in devices if d not in vibe_devices]
+    if other_hid:
+        line("OK", f"non-Vibe hidraw devices ignored by auto-selection: {len(other_hid)}")
+
+    root = _repo_root()
+    cli_names = args.cli or ["codex", "claude"]
+    for name in cli_names:
+        wrapper_path = os.path.join(root, "bin", name)
+        wrapper_real = os.path.realpath(wrapper_path)
+        found = shutil.which(name)
+        if not os.path.exists(wrapper_path):
+            line("WARN", f"{name}: wrapper missing at {wrapper_path}")
+            continue
+        if found is None:
+            line("WARN", f"{name}: not found on PATH")
+            continue
+        if os.path.realpath(found) == wrapper_real:
+            line("OK", f"{name}: wrapper active at {found}")
+            real_cli = _find_cli_behind_wrapper(name, wrapper_real)
+            if real_cli is None:
+                line("FAIL", f"{name}: no real CLI found behind wrapper on PATH")
+            else:
+                line("OK", f"{name}: real CLI candidate behind wrapper: {real_cli}")
+        else:
+            line("WARN", f"{name}: PATH resolves to non-wrapper binary: {found}")
+
+    if os.path.exists(args.log):
+        line("OK", f"daemon log exists: {args.log}")
+    else:
+        line("WARN", f"daemon log missing: {args.log}")
+
+    print()
+    if fail:
+        print("doctor result: FAIL")
+        return 1
+    print("doctor result: OK with warnings" if state is None or not vibe_devices else "doctor result: OK")
     return 0
 
 
@@ -141,7 +405,31 @@ def cmd_sessions(args: argparse.Namespace) -> int:
         print(f"mode          : {state.get('mode')}")
     if state.get("hidraw_path"):
         print(f"hidraw        : {state.get('hidraw_path')}")
-    print(f"active sid    : {state.get('active_sid')}")
+    focused_sid = state.get("focused_sid")
+    if focused_sid is None:
+        focused_sid = state.get("active_sid")
+    print(f"focused sid   : {focused_sid}")
+    print(f"board panel   : {state.get('board_panel')}")
+    if state.get("selector_focus_sid") is not None:
+        print(f"selector sid  : {state.get('selector_focus_sid')}")
+    if state.get("terminal_visible") is not None:
+        print(f"terminal view : {state.get('terminal_visible')}")
+    if state.get("last_board_event"):
+        print(f"last input    : {state.get('last_board_event')}")
+        decoded = _describe_last_board_event(str(state.get("last_board_event")))
+        if decoded:
+            print(f"input decoded : {decoded}")
+        if state.get("last_board_event_seq") is not None:
+            print(f"input seq     : {state.get('last_board_event_seq')}")
+    if state.get("last_board_tx"):
+        print(f"last board tx : {state.get('last_board_tx')}")
+    hooked_agents = state.get("hooked_agents", [])
+    print(f"hooked agents : {len(hooked_agents)}")
+    for agent in hooked_agents:
+        print(
+            f"  pid={agent.get('pid')}  kind={agent.get('kind')}  "
+            f"sid={agent.get('sid')}"
+        )
     print(f"sessions ({len(state.get('sessions', []))}):")
     for s in state.get("sessions", []):
         ctx = s.get("context", {}) or {}
@@ -151,6 +439,31 @@ def cmd_sessions(args: argparse.Namespace) -> int:
             f"buf={state['buffers'].get(str(s['sid']), 0)}b  ctx={{{ctx_short}}}"
         )
     return 0
+
+
+def _describe_last_board_event(event: str) -> str:
+    if not event.startswith("key bits=0x"):
+        return ""
+    parts = event.split()
+    try:
+        bits = int(parts[1].split("=", 1)[1], 16)
+    except (IndexError, ValueError):
+        return ""
+    enc_pressed = "enc=1" in parts
+    names = [
+        ("REJECT", 0),
+        ("VOICE", 1),
+        ("SESSION", 2),
+        ("VOTE_REVIEW", 3),
+        ("AGENT_MODEL", 4),
+        ("MULTI_FUNCTION", 5),
+        ("CONFIRM", 6),
+        ("MENU_DEBUG", 7),
+    ]
+    pressed = [name for name, bit in names if bits & (1 << bit)]
+    if enc_pressed:
+        pressed.append("ENCODER_PRESS")
+    return ", ".join(pressed) if pressed else "none"
 
 
 def _await_response(client: MockHidClient, *, timeout: float = 2.0) -> Optional[int]:
@@ -426,6 +739,92 @@ def cmd_tail_screen(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_windows_doctor(args: argparse.Namespace) -> int:
+    from .windows_host import doctor_checks, has_failures
+
+    checks = doctor_checks()
+    print("vibe-bridge windows doctor")
+    print()
+    for check in checks:
+        print(f"[{check.status}] {check.name}: {check.detail}")
+    print()
+    if has_failures(checks):
+        print("windows product result: NOT READY")
+        return 1
+    print("windows product result: READY")
+    return 0
+
+
+def cmd_windows_plan(args: argparse.Namespace) -> int:
+    from .windows_host import adapter_plan
+
+    print("vibe-bridge windows product plan")
+    print()
+    print("Protocol: keep the existing board-assigned session_id, HID packets, VT100 stream,")
+    print("WINDOW_ACTIVATE, key events, and encoder events unchanged.")
+    print()
+    for adapter in adapter_plan():
+        print(f"- {adapter.name} [{adapter.status}]")
+        print(f"  source     : {adapter.source}")
+        print(f"  session    : {adapter.session_path}")
+        print(f"  activation : {adapter.activation_path}")
+    return 0
+
+
+def cmd_windows_daemon(args: argparse.Namespace) -> int:
+    from .windows_host import default_screen_path, default_state_path
+
+    endpoint = f"tcp://{args.host}:{args.port}"
+    state_path = args.state or default_state_path()
+    screen_path = args.screen or default_screen_path()
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    os.makedirs(os.path.dirname(screen_path), exist_ok=True)
+    device = args.device
+    hid_transport = None
+    hid_path = None
+    if device != "none":
+        from .transport_win_hid import WinHidTransport, resolve_win_hid_device
+
+        hid_path = resolve_win_hid_device() if device == "auto" else device
+        if not hid_path:
+            print("windows daemon: no Vibe HID 359f:2120 device found", file=sys.stderr)
+            return 1
+        hid_transport = WinHidTransport(hid_path)
+
+    cfg = DaemonConfig(
+        sock_path=endpoint,
+        state_path=state_path,
+        screen_path=screen_path,
+        hidraw_path=hid_path,
+        hid_transport=hid_transport,
+        hid_mode="real-winhid",
+    )
+    print(f"windows daemon ipc : {endpoint}")
+    print(f"windows daemon hid : {hid_path or 'disabled'}")
+    print(f"windows daemon state : {state_path}")
+    daemon = Daemon(cfg)
+    daemon.run_forever()
+    return 0
+
+
+def cmd_windows_run(args: argparse.Namespace) -> int:
+    from .windows_runner import run_windows_cli
+
+    return run_windows_cli(args.argv, sock_path=args.ipc, plugin_name=args.plugin)
+
+
+def cmd_windows_wsl_cli(args: argparse.Namespace) -> int:
+    from .windows_runner import run_wsl_cli
+
+    return run_wsl_cli(
+        args.argv,
+        sock_path=args.ipc,
+        plugin_name=args.plugin,
+        distro=args.distro,
+        wsl_cwd=args.wsl_cwd,
+    )
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -433,6 +832,8 @@ def main(argv: Optional[list] = None) -> int:
 
     dispatch = {
         "daemon": cmd_daemon,
+        "ensure-daemon": cmd_ensure_daemon,
+        "doctor": cmd_doctor,
         "sessions": cmd_sessions,
         "request-session": cmd_request_session,
         "send-vt100": cmd_send_vt100,
@@ -448,6 +849,16 @@ def main(argv: Optional[list] = None) -> int:
             "handshake": cmd_hid_handshake,
         }
         return hid_dispatch[args.hid_cmd](args)
+    if args.cmd == "windows":
+        windows_dispatch = {
+            "doctor": cmd_windows_doctor,
+            "plan": cmd_windows_plan,
+            "daemon": cmd_windows_daemon,
+            "cli": cmd_windows_run,
+            "wsl-cli": cmd_windows_wsl_cli,
+            "run": cmd_windows_run,
+        }
+        return windows_dispatch[args.windows_cmd](args)
     handler = dispatch[args.cmd]
     return handler(args)
 

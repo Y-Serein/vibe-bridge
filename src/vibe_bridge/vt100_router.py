@@ -116,6 +116,23 @@ class Vt100Router:
                 pass
         return True
 
+    def replay_active(self) -> bool:
+        """Replay the active window to the sink even if it is already active."""
+        with self._lock:
+            active = self._active
+            sink = self._screen_sink
+            if active is None or sink is None:
+                return False
+            buf = self._buffers.get(active)
+            body = b"".join(buf) if buf else b""
+            replay = SCREEN_CLEAR + body
+
+        try:
+            sink(active, replay)
+        except Exception:
+            return False
+        return True
+
     def active(self) -> Optional[int]:
         with self._lock:
             return self._active

@@ -1,0 +1,17 @@
+[package]
+name = "vb-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "1"
+vb-core = { path = "../vb-core" }
+
+[lib]
+name = "vb_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vb-host"
+path = "src/main.rs"

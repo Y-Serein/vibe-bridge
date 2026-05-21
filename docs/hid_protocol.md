@@ -137,14 +137,14 @@ payload[1] bit1..7 reserved, send as 0
 
 | Bit | Physical input | Board action name | Current video state |
 | --- | -------------- | ----------------- | ------------------- |
-| 0   | KEY1 / A15     | Reject            | `reject.264`        |
-| 1   | KEY2 / A24     | Voice             | `voice.264`         |
-| 2   | KEY3 / A23     | Session           | `session.264`       |
+| 0   | KEY1 / P19     | Reject            | `reject.264`        |
+| 1   | KEY2 / A22     | Voice             | `voice.264`         |
+| 2   | KEY3 / A25     | Session           | `session.264`       |
 | 3   | KEY4 / A27     | Vote / Review     | `vote_review.264`   |
-| 4   | KEY5 / A25     | Agent / Model     | `agent_model.264`   |
-| 5   | KEY6 / A22     | Multi Function    | `multi.264`         |
-| 6   | KEY7 / A29     | Confirm           | `confirm.264`       |
-| 7   | KEY8 / P19     | Menu / Debug      | `menu_debug.264`    |
+| 4   | KEY5 / A23     | Agent / Model     | `agent_model.264`   |
+| 5   | KEY6 / A24     | Multi Function    | `multi.264`         |
+| 6   | KEY7 / A15     | Confirm           | `confirm.264`       |
+| 7   | -              | Menu / Debug      | reserved            |
 
 Action intent:
 
@@ -161,8 +161,8 @@ Action intent:
   network status.
 - `CONFIRM`: confirm, send, execute the highlighted action, or apply the
   current suggestion.
-- `MENU_DEBUG`: short press opens the main menu or debug menu; reserved for
-  future expansion.
+- `MENU_DEBUG`: protocol-compatible reserved bit; the current 7-key board has
+  no physical key for it.
 - `ENC_SW / P21`: select/enter. This is a light confirm or drill-in action.
 
 Encoder A/B (`P22` / `P23`) is used for list scrolling, candidate selection,
@@ -179,9 +179,11 @@ payload_length   = 1
 payload[0]       = signed int8 delta, -127..127
 ```
 
-The bridge daemon handles encoder delta locally to switch active windows, then
-routes the same `ENCODER_EVENT` to the active plugin. `KEY_EVENT` is only routed
-to the active plugin; board-local video switching is handled by the board-side
+The bridge daemon handles `SESSION` as a host-side session selector: after a
+`SESSION` key event, encoder deltas switch between existing active windows and
+`CONFIRM` or `ENC_SW` exits the selector. Outside that selector, `ENCODER_EVENT`
+is routed to the active plugin/wrapper so tools can use it for list navigation
+or candidate selection. Board-local video switching is handled by the board-side
 event FIFO and `auto.sh`, not by the host daemon.
 
 ## Wire compatibility goals

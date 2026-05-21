@@ -1,0 +1,29 @@
+{
+  "name": "vibe-bridge-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node node_modules/vite/bin/vite.js",
+    "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit",
+    "build": "npm run typecheck && node node_modules/vite/bin/vite.js build",
+    "tauri": "node node_modules/@tauri-apps/cli/tauri.js",
+    "tauri:dev": "node node_modules/@tauri-apps/cli/tauri.js dev",
+    "tauri:build": "node node_modules/@tauri-apps/cli/tauri.js build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^1.16.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0"
+  }
+}
+

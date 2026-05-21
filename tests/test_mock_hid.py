@@ -1,4 +1,5 @@
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -20,6 +21,16 @@ def _tmp_sock() -> str:
     os.close(fd)
     os.unlink(path)
     return path
+
+
+def _tmp_tcp_endpoint() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+    finally:
+        sock.close()
+    return f"tcp://{host}:{port}"
 
 
 class MockHidTests(unittest.TestCase):
@@ -53,6 +64,28 @@ class MockHidTests(unittest.TestCase):
             first_pkt, _ = received[0]
             self.assertEqual(first_pkt.command, int(Cmd.REQUEST_SESSION))
             self.assertEqual(first_pkt.payload, b"unit")
+        finally:
+            server.stop()
+
+    def test_tcp_endpoint_uses_same_packet_framing(self):
+        endpoint = _tmp_tcp_endpoint()
+
+        def handler(pkt: Packet, client: ClientHandle) -> None:
+            if pkt.command == int(Cmd.REQUEST_SESSION):
+                client.send(make_session_response(321, Status.CREATED))
+
+        server = MockHidServer(handler, sock_path=endpoint)
+        server.start()
+        try:
+            client = MockHidClient(endpoint)
+            try:
+                client.send_packet(make_request_session(hint=b"tcp"))
+                reply = client.recv_packet(timeout=1.0)
+                self.assertIsNotNone(reply)
+                self.assertEqual(reply.command, int(Cmd.SESSION_RESPONSE))
+                self.assertEqual(reply.session_id, 321)
+            finally:
+                client.close()
         finally:
             server.stop()
 

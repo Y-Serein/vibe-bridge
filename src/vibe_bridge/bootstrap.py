@@ -16,7 +16,7 @@ import sys
 import time
 from typing import Optional
 
-from .mock_hid import DEFAULT_SOCK_PATH
+from .mock_hid import DEFAULT_SOCK_PATH, connect_packet_socket, is_tcp_endpoint
 
 ENV_HIDRAW_DEVICE = "VIBE_HIDRAW_DEVICE"
 VIBE_USB_VID = 0x359F
@@ -25,18 +25,18 @@ DEFAULT_STATE_PATH = "/tmp/vibe-bridge-state.json"
 
 
 def can_connect(sock_path: str, *, timeout: float = 0.2) -> bool:
-    """Return True if a Unix socket at ``sock_path`` accepts a connection."""
-    if not os.path.exists(sock_path):
+    """Return True if a packet IPC endpoint accepts a connection."""
+    if not is_tcp_endpoint(sock_path) and not os.path.exists(sock_path):
         return False
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    s: Optional[socket.socket] = None
     try:
-        s.connect(sock_path)
+        s = connect_packet_socket(sock_path, timeout=timeout)
         return True
     except (OSError, socket.timeout):
         return False
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 
 
 def spawn_daemon_detached(
@@ -51,10 +51,18 @@ def spawn_daemon_detached(
     own session (``start_new_session=True``) so it survives the wrapper's
     ``execvp`` into the real CLI.
     """
-    args = [sys.executable, "-m", "vibe_bridge.main", "--sock", sock_path, "daemon"]
+    args = [
+        sys.executable,
+        "-m",
+        "vibe_bridge.main",
+        "--sock",
+        sock_path,
+        "-v",
+        "daemon",
+    ]
     if extra_args:
         args.extend(extra_args)
-    log_fd = open(log_path, "ab")
+    log_fd = open(log_path, "wb")
     try:
         proc = subprocess.Popen(
             args,
@@ -84,7 +92,7 @@ def _env_for_subprocess() -> dict:
 
 
 def resolve_hidraw_device() -> Optional[str]:
-    """Return the hidraw node to use for the board, if one is discoverable."""
+    """Return the Vibe board hidraw node, if it is safely discoverable."""
     explicit = os.environ.get(ENV_HIDRAW_DEVICE)
     if explicit:
         return explicit
@@ -104,9 +112,6 @@ def resolve_hidraw_device() -> Optional[str]:
         rw = [d for d in exact if d.readable and d.writable]
         return (rw[0] if rw else exact[0]).path
 
-    rw_hidraw = [d for d in devices if d.readable and d.writable]
-    if len(rw_hidraw) == 1:
-        return rw_hidraw[0].path
     return None
 
 
@@ -162,6 +167,8 @@ def ensure_daemon_running(
     hidraw_device = resolve_hidraw_device()
     if _daemon_ready(sock_path, hidraw_device, state_path):
         return True
+    if can_connect(sock_path):
+        return False
 
     extra_args = ["--state", state_path]
     if hidraw_device:

@@ -3,9 +3,12 @@ import unittest
 from unittest import mock
 
 from vibe_bridge.mock_hid import DEFAULT_SOCK_PATH
+from vibe_bridge.hid_protocol import BoardKey, Cmd, make_encoder_event, make_key_event
 from vibe_bridge.wrapper import (
+    BoardActionHandler,
     DEFAULT_LCD_COLS,
     DEFAULT_LCD_ROWS,
+    ENV_DISABLE,
     ENV_LCD_COLS,
     ENV_LCD_CHAR_ADAPT,
     ENV_LCD_ROWS,
@@ -13,6 +16,7 @@ from vibe_bridge.wrapper import (
     ENV_REUSE_SESSION,
     ENV_SESSION_ID,
     ENV_SOCK_PATH,
+    ENV_ALLOW_MOCK,
     LcdOutputAdapter,
     LEGACY_REAL_SOCK_PATH,
     _existing_session_from_env,
@@ -21,6 +25,7 @@ from vibe_bridge.wrapper import (
     _lcd_pty_size,
     _open_session_client,
     _resolve_sock_path,
+    run,
 )
 
 
@@ -101,11 +106,14 @@ class WrapperTests(unittest.TestCase):
 
     def test_open_session_activates_new_sid(self):
         sent = []
+        created = []
 
         class FakePlugin:
-            def __init__(self, *, plugin_name, sock_path):
+            def __init__(self, *, plugin_name, sock_path, auto_reacquire=True):
                 self.plugin_name = plugin_name
                 self.sock_path = sock_path
+                self.auto_reacquire = auto_reacquire
+                created.append(self)
 
             def connect(self):
                 pass
@@ -117,6 +125,8 @@ class WrapperTests(unittest.TestCase):
                 sent.append(packet)
 
         with mock.patch(
+            "vibe_bridge.wrapper.resolve_hidraw_device", return_value="/dev/hidraw0"
+        ), mock.patch(
             "vibe_bridge.wrapper.ensure_daemon_running", return_value=True
         ), mock.patch("vibe_bridge.wrapper.PluginClient", FakePlugin):
             plugin, sid = _open_session_client("codex", DEFAULT_SOCK_PATH)
@@ -126,13 +136,18 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0].session_id, 77)
         self.assertEqual(sent[0].command, 0x21)
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].auto_reacquire)
 
     def test_open_session_activates_reused_sid(self):
         sent = []
+        created = []
 
         class FakePlugin:
-            def __init__(self, *, plugin_name, sock_path):
+            def __init__(self, *, plugin_name, sock_path, auto_reacquire=True):
                 self.sid = None
+                self.auto_reacquire = auto_reacquire
+                created.append(self)
 
             def adopt_session(self, sid):
                 self.sid = sid
@@ -148,6 +163,8 @@ class WrapperTests(unittest.TestCase):
             {ENV_SESSION_ID: "88", ENV_REUSE_SESSION: "1"},
             clear=True,
         ), mock.patch(
+            "vibe_bridge.wrapper.resolve_hidraw_device", return_value="/dev/hidraw0"
+        ), mock.patch(
             "vibe_bridge.wrapper.ensure_daemon_running", return_value=True
         ), mock.patch("vibe_bridge.wrapper.PluginClient", FakePlugin):
             plugin, sid = _open_session_client("codex", DEFAULT_SOCK_PATH)
@@ -157,6 +174,171 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0].session_id, 88)
         self.assertEqual(sent[0].command, 0x21)
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].auto_reacquire)
+
+    def test_open_session_skips_bridge_without_hidraw_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "vibe_bridge.wrapper.resolve_hidraw_device", return_value=None
+        ), mock.patch("vibe_bridge.wrapper.ensure_daemon_running") as ensure, mock.patch(
+            "vibe_bridge.wrapper.PluginClient"
+        ) as plugin_cls:
+            plugin, sid = _open_session_client("codex", DEFAULT_SOCK_PATH)
+
+        self.assertIsNone(plugin)
+        self.assertIsNone(sid)
+        ensure.assert_not_called()
+        plugin_cls.assert_not_called()
+
+    def test_open_session_allows_mock_only_when_explicitly_enabled(self):
+        class FakePlugin:
+            def __init__(self, *, plugin_name, sock_path, auto_reacquire=True):
+                pass
+
+            def connect(self):
+                pass
+
+            def acquire_session(self, timeout):
+                return 77
+
+            def send_packet(self, packet):
+                pass
+
+        with mock.patch.dict(os.environ, {ENV_ALLOW_MOCK: "1"}, clear=True), mock.patch(
+            "vibe_bridge.wrapper.resolve_hidraw_device", return_value=None
+        ), mock.patch(
+            "vibe_bridge.wrapper.ensure_daemon_running", return_value=True
+        ) as ensure, mock.patch("vibe_bridge.wrapper.PluginClient", FakePlugin):
+            plugin, sid = _open_session_client("codex", DEFAULT_SOCK_PATH)
+
+        self.assertIsNotNone(plugin)
+        self.assertEqual(sid, 77)
+        ensure.assert_called_once()
+
+    def test_run_disables_recursive_wrapping_for_child_cli(self):
+        captured = {}
+
+        class FakePlugin:
+            session_id = 55
+
+            def set_board_packet_handler(self, callback):
+                pass
+
+            def send_vt100(self, data):
+                pass
+
+            def close(self):
+                pass
+
+        def fake_run_pty(real, argv, env, plugin):
+            captured["real"] = real
+            captured["argv"] = argv
+            captured["env"] = env
+            captured["plugin"] = plugin
+            return 0
+
+        with mock.patch.dict(os.environ, {"PATH": "/wrapper:/real"}, clear=True), \
+            mock.patch("vibe_bridge.wrapper.find_real_binary", return_value="/real/codex"), \
+            mock.patch("vibe_bridge.wrapper._select_mode", return_value="pty"), \
+            mock.patch(
+                "vibe_bridge.wrapper._open_session_client",
+                return_value=(FakePlugin(), 55),
+            ), \
+            mock.patch("vibe_bridge.wrapper._run_pty", side_effect=fake_run_pty):
+            rc = run("codex", argv=["codex"], self_paths=["/wrapper/codex"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["env"][ENV_DISABLE], "1")
+        self.assertEqual(captured["env"][ENV_SESSION_ID], "55")
+
+    def test_board_action_reject_injects_ctrl_c(self):
+        injected = []
+
+        class FakePlugin:
+            session_id = 7
+
+            def send_packet(self, packet):
+                raise AssertionError("reject should not send daemon command")
+
+        handler = BoardActionHandler(plugin=FakePlugin(), inject_input=injected.append)
+
+        handler.handle_packet(make_key_event(1 << BoardKey.REJECT))
+
+        self.assertEqual(injected, [b"\x03"])
+
+    def test_board_action_product_keys_do_not_inject_prompts(self):
+        injected = []
+
+        class FakePlugin:
+            session_id = 7
+
+            def send_packet(self, packet):
+                raise AssertionError("product keys should not send daemon command")
+
+        handler = BoardActionHandler(plugin=FakePlugin(), inject_input=injected.append)
+
+        for key in (
+            BoardKey.VOICE,
+            BoardKey.VOTE_REVIEW,
+            BoardKey.AGENT_MODEL,
+            BoardKey.MULTI_FUNCTION,
+            BoardKey.MENU_DEBUG,
+        ):
+            handler.handle_packet(make_key_event(1 << key))
+
+        self.assertEqual(injected, [])
+
+    def test_board_action_confirm_and_encoder_push_inject_enter(self):
+        injected = []
+
+        class FakePlugin:
+            session_id = 7
+
+            def send_packet(self, packet):
+                raise AssertionError("confirm should not send daemon command")
+
+        handler = BoardActionHandler(plugin=FakePlugin(), inject_input=injected.append)
+
+        handler.handle_packet(make_key_event(1 << BoardKey.CONFIRM))
+        handler.handle_packet(make_key_event(0, encoder_pressed=True))
+
+        self.assertEqual(injected, [b"\r", b"\r"])
+
+    def test_board_action_encoder_delta_does_not_inject_prompt_history(self):
+        injected = []
+
+        class FakePlugin:
+            session_id = 7
+
+            def send_packet(self, packet):
+                raise AssertionError("encoder should not send daemon command")
+
+        handler = BoardActionHandler(plugin=FakePlugin(), inject_input=injected.append)
+
+        handler.handle_packet(make_encoder_event(2))
+        handler.handle_packet(make_encoder_event(-1))
+
+        self.assertEqual(injected, [])
+
+    def test_board_action_session_sends_window_switch_without_injecting_text(self):
+        injected = []
+        sent = []
+
+        class FakePlugin:
+            session_id = 7
+
+            def send_packet(self, packet):
+                sent.append(packet)
+
+        handler = BoardActionHandler(plugin=FakePlugin(), inject_input=injected.append)
+
+        handler.handle_packet(make_key_event(1 << BoardKey.SESSION))
+
+        self.assertEqual(injected, [])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].command, int(Cmd.WINDOW_SWITCH))
+        self.assertEqual(sent[0].session_id, 7)
+        self.assertEqual(sent[0].payload, b"\x01")
 
     def test_lcd_pty_size_defaults_to_current_lcd_grid(self):
         with mock.patch.dict(os.environ, {}, clear=True):

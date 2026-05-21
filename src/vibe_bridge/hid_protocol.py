@@ -47,12 +47,18 @@ class Cmd(IntEnum):
     REQUEST_SESSION = 0x01
     SESSION_RESPONSE = 0x02
     SESSION_INVALID = 0x03
+    SESSION_HEARTBEAT = 0x04
+    """Host -> board: keep-alive for ``sid``. Host emits one every 10s for every
+    live session; board treats 30s of silence as DISCONNECTED."""
+    SESSION_FOCUS = 0x05
+    """Board -> host: user picked ``sid`` in the on-board grid. Host opens the
+    VT100 stream gate so only ``sid``'s bytes are forwarded back to the board."""
 
     KEY_EVENT = 0x10
     ENCODER_EVENT = 0x11
 
-    WINDOW_SWITCH = 0x20
-    WINDOW_ACTIVATE = 0x21
+    WINDOW_SWITCH = 0x20  # deprecated: board owns its own UI now
+    WINDOW_ACTIVATE = 0x21  # deprecated: board owns its own UI now
 
     VT100_STREAM = 0x30
 
@@ -72,6 +78,22 @@ class Status(IntEnum):
     EXPIRED = 0x03
     POOL_FULL = 0x04
     RECLAIMED = 0x05
+    DISCONNECTED = 0x06
+
+
+class SessionState(IntEnum):
+    """1-byte ``state`` carried in ``CMD_STATUS_UPDATE`` payload[0].
+
+    The board renders ``sid + state`` in the session grid. Heartbeat liveness
+    overrides the value: 30s without a heartbeat forces ``DISCONNECTED``.
+    """
+
+    CONNECTED = 0x00
+    DISCONNECTED = 0x01
+    RUN = 0x02
+    WAIT = 0x03
+    DONE = 0x04
+    ERROR = 0x05
 
 
 class BoardKey(IntEnum):
@@ -136,7 +158,8 @@ class KeyEvent:
 
     Payload schema, matching the current AIKB firmware:
 
-    - byte 0: normal key bitmap, bits 0..7 map to :class:`BoardKey`
+    - byte 0: normal key bitmap, bits 0..6 map to current board keys;
+      bit7 is protocol-compatible/reserved as :class:`BoardKey.MENU_DEBUG`
     - byte 1 bit 0: encoder push switch
     """
 
@@ -203,6 +226,45 @@ def make_session_invalid(session_id: int, status: Status) -> Packet:
         session_id=session_id,
         payload=bytes([int(status)]),
     )
+
+
+def make_session_heartbeat(session_id: int) -> Packet:
+    """Host -> board keepalive packet for ``session_id``."""
+    return Packet(
+        report_id=int(ReportId.DEVICE_BOUND),
+        command=int(Cmd.SESSION_HEARTBEAT),
+        session_id=session_id,
+        payload=b"",
+    )
+
+
+def make_session_focus(session_id: int) -> Packet:
+    """Board -> host focus packet. Used in tests; the firmware emits it natively."""
+    return Packet(
+        report_id=int(ReportId.HOST_BOUND),
+        command=int(Cmd.SESSION_FOCUS),
+        session_id=session_id,
+        payload=b"",
+    )
+
+
+def make_status_update(session_id: int, state: SessionState) -> Packet:
+    """Host -> board state report. Board mirrors the byte into the grid row."""
+    return Packet(
+        report_id=int(ReportId.DEVICE_BOUND),
+        command=int(Cmd.STATUS_UPDATE),
+        session_id=session_id,
+        payload=bytes([int(state)]),
+    )
+
+
+def decode_status_update_payload(payload: bytes) -> SessionState:
+    if not payload:
+        raise ProtocolError("STATUS_UPDATE payload is empty")
+    try:
+        return SessionState(payload[0])
+    except ValueError as exc:
+        raise ProtocolError(f"unknown state byte 0x{payload[0]:02x}") from exc
 
 
 def make_vt100_chunk(session_id: int, chunk: bytes) -> Packet:

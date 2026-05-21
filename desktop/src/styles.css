@@ -1,0 +1,140 @@
+:root {
+  color: #192029;
+  background: #f5f7fb;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.topbar p {
+  margin: 6px 0 0;
+  color: #5d6775;
+  font-size: 14px;
+}
+
+.primary-button,
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid #cfd8e3;
+  background: #ffffff;
+  color: #192029;
+  cursor: pointer;
+}
+
+.primary-button {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 6px;
+}
+
+.primary-button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.terminal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.terminal-list h2 {
+  margin: 18px 0 4px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.terminal-row,
+.empty-state {
+  display: grid;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #d9e1ec;
+  background: #ffffff;
+  border-radius: 8px;
+}
+
+.terminal-row {
+  grid-template-columns: 20px minmax(0, 1fr) 36px;
+  padding: 12px;
+}
+
+.empty-state {
+  grid-template-columns: 22px minmax(0, 1fr);
+  padding: 18px;
+  color: #687386;
+}
+
+.terminal-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.terminal-main strong,
+.terminal-main span,
+.terminal-main code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-main strong {
+  font-size: 14px;
+}
+
+.terminal-main span {
+  color: #5d6775;
+  font-size: 12px;
+}
+
+.terminal-main code {
+  color: #334155;
+  font-size: 12px;
+}
+
+.icon-button {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+}
+
+.icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}

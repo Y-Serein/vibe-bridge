@@ -68,6 +68,7 @@ class WindowSwitchIntegrationTests(unittest.TestCase):
             sock_path=sock_path,
             state_path=state_path,
             screen_path=screen_path,
+            agent_scan_enabled=False,
         )
         self.daemon = Daemon(cfg)
         self.daemon.start()
@@ -101,8 +102,10 @@ class WindowSwitchIntegrationTests(unittest.TestCase):
 
     # --------------------------------------------------------------- test
 
-    def test_two_sessions_isolated_and_switchable(self) -> None:
-        # Two plugin clients connect, each gets its own sid.
+    def test_two_sessions_isolated_and_switched_by_router(self) -> None:
+        """Board owns the picker now; in mock mode we drive
+        ``router.set_active`` directly to simulate the effect of an inbound
+        ``CMD_SESSION_FOCUS`` from the board firmware."""
         c1 = MockHidClient(self.sock_path)
         c2 = MockHidClient(self.sock_path)
         try:
@@ -110,62 +113,41 @@ class WindowSwitchIntegrationTests(unittest.TestCase):
             sid2 = _acquire_session(c2, b"plugin-B")
             self.assertNotEqual(sid1, sid2)
 
-            # sid1 registered first → it should be the default active window.
-            _wait_until(lambda: self.daemon.router.active() == sid1)
+            # sid1 registered first → it is the default active window.
             self.assertEqual(self.daemon.router.active(), sid1)
-
-            # Plugin A writes "AAA" → goes to active window's sink.
             c1.send_packet(make_vt100_chunk(sid1, b"AAA"))
             self._wait_for_sink(1)
             with self._sink_lock:
                 self.assertEqual(self.sink_calls[-1], (sid1, b"AAA"))
 
-            # Plugin B writes "BBB" → buffered for sid2 but NOT mirrored
-            # because sid1 is still active.
+            # Plugin B writes while sid2 is inactive → buffered, no sink call.
             c2.send_packet(make_vt100_chunk(sid2, b"BBB"))
-            # Give the daemon a moment to process the append even though it
-            # should not produce a sink call.
             time.sleep(0.05)
             with self._sink_lock:
                 self.assertEqual(len(self.sink_calls), 1, self.sink_calls)
             self.assertEqual(self.daemon.router.snapshot(sid2), b"BBB")
 
-            # WINDOW_SWITCH +1 → wraps from sid1 to sid2, sink replays.
-            switch_pkt = Packet(
-                report_id=int(ReportId.HOST_BOUND),
-                command=int(Cmd.WINDOW_SWITCH),
-                session_id=SESSION_BROADCAST,
-                payload=bytes([1]),
-            )
-            c1.send_packet(switch_pkt)
-            _wait_until(lambda: self.daemon.router.active() == sid2)
-            self.assertEqual(self.daemon.router.active(), sid2)
+            # Board "focuses" sid2 → router replays buffer.
+            self.assertTrue(self.daemon.router.set_active(sid2))
             self._wait_for_sink(2)
             with self._sink_lock:
                 self.assertEqual(self.sink_calls[-1], (sid2, SCREEN_CLEAR + b"BBB"))
 
-            # Now plugin B writes "CCC" → mirrors live to the screen.
+            # Live updates for sid2 now mirror immediately.
             c2.send_packet(make_vt100_chunk(sid2, b"CCC"))
             self._wait_for_sink(3)
             with self._sink_lock:
                 self.assertEqual(self.sink_calls[-1], (sid2, b"CCC"))
 
-            # Plugin A writes "DDD" while inactive → buffered, no sink call.
+            # Plugin A writes while inactive → buffered only.
             c1.send_packet(make_vt100_chunk(sid1, b"DDD"))
             time.sleep(0.05)
             with self._sink_lock:
                 self.assertEqual(len(self.sink_calls), 3)
             self.assertEqual(self.daemon.router.snapshot(sid1), b"AAADDD")
 
-            # WINDOW_ACTIVATE explicitly to sid1 → replay AAA+DDD.
-            activate_pkt = Packet(
-                report_id=int(ReportId.HOST_BOUND),
-                command=int(Cmd.WINDOW_ACTIVATE),
-                session_id=sid1,
-                payload=b"",
-            )
-            c1.send_packet(activate_pkt)
-            _wait_until(lambda: self.daemon.router.active() == sid1)
+            # Board re-focuses sid1 → replay AAA+DDD.
+            self.assertTrue(self.daemon.router.set_active(sid1))
             self._wait_for_sink(4)
             with self._sink_lock:
                 self.assertEqual(self.sink_calls[-1], (sid1, SCREEN_CLEAR + b"AAADDD"))

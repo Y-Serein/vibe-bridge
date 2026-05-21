@@ -35,14 +35,14 @@ class BootstrapTests(unittest.TestCase):
         ):
             self.assertEqual(resolve_hidraw_device(), "/dev/hidraw1")
 
-    def test_resolve_hidraw_device_falls_back_to_single_rw_device(self):
+    def test_resolve_hidraw_device_ignores_non_vibe_single_rw_device(self):
         devices = [
             HidrawDeviceInfo(path="/dev/hidraw3", vid=None, pid=None, readable=True, writable=True),
         ]
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
             "vibe_bridge.transport_hidraw.list_hidraw_devices", return_value=devices
         ):
-            self.assertEqual(resolve_hidraw_device(), "/dev/hidraw3")
+            self.assertIsNone(resolve_hidraw_device())
 
     def test_daemon_ready_accepts_mock_only_without_hidraw_device(self):
         state_path = self._write_state(
@@ -125,7 +125,7 @@ class BootstrapTests(unittest.TestCase):
         ), mock.patch(
             "vibe_bridge.bootstrap.spawn_daemon_detached", side_effect=fake_spawn
         ) as spawn:
-            self.assertTrue(
+            self.assertFalse(
                 ensure_daemon_running(
                     "/tmp/vibe-bridge.sock",
                     state_path=state_path,
@@ -133,7 +133,7 @@ class BootstrapTests(unittest.TestCase):
                     poll_interval=0.001,
                 )
             )
-            spawn.assert_called_once()
+            spawn.assert_not_called()
 
     def test_ensure_daemon_reuses_connectable_mock_without_hidraw(self):
         state_path = self._write_state(

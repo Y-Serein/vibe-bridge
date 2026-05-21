@@ -1,10 +1,14 @@
-"""Mock HID transport over a Unix domain socket.
+"""Mock/local packet transport over Unix sockets or loopback TCP.
 
 The daemon side (``MockHidServer``) accepts plugin connections, dispatches each
 incoming packet through a handler callback, and lets the handler push packets
 back to the originating client. The plugin side (``MockHidClient``) speaks the
 same packet format carried by real HID reports, so mock and hidraw modes share
 one protocol.
+
+Unix sockets are the default development path.  ``tcp://HOST:PORT`` endpoints
+use the same length-prefixed packet framing and are the Windows product IPC
+path, because native Windows cannot rely on the Linux ``/tmp/*.sock`` contract.
 """
 
 from __future__ import annotations
@@ -24,6 +28,41 @@ from .transport import (
 )
 
 DEFAULT_SOCK_PATH = "/tmp/vibe-bridge.sock"
+DEFAULT_TCP_ENDPOINT = "tcp://127.0.0.1:8765"
+
+
+def is_tcp_endpoint(endpoint: str) -> bool:
+    return endpoint.startswith("tcp://")
+
+
+def parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
+    if not is_tcp_endpoint(endpoint):
+        raise ValueError(f"not a tcp endpoint: {endpoint}")
+    host_port = endpoint[len("tcp://") :]
+    host, sep, port_s = host_port.rpartition(":")
+    if not sep or not host:
+        raise ValueError(f"tcp endpoint must be tcp://HOST:PORT: {endpoint}")
+    port = int(port_s)
+    if not (1 <= port <= 65535):
+        raise ValueError(f"tcp port out of range: {endpoint}")
+    return host, port
+
+
+def connect_packet_socket(endpoint: str, *, timeout: Optional[float] = None) -> socket.socket:
+    if is_tcp_endpoint(endpoint):
+        host, port = parse_tcp_endpoint(endpoint)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect((host, port))
+        sock.settimeout(None)
+        return sock
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if timeout is not None:
+        sock.settimeout(timeout)
+    sock.connect(endpoint)
+    sock.settimeout(None)
+    return sock
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -58,8 +97,7 @@ class MockHidClient(Transport):
 
     def __init__(self, sock_path: str = DEFAULT_SOCK_PATH) -> None:
         self._sock_path = sock_path
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(sock_path)
+        self._sock = connect_packet_socket(sock_path)
         self._lock = threading.Lock()
 
     def send_packet(self, packet: Packet) -> None:
@@ -148,13 +186,18 @@ class MockHidServer:
     def start(self) -> None:
         if self._sock is not None:
             raise RuntimeError("server already started")
-        try:
-            os.unlink(self._sock_path)
-        except FileNotFoundError:
-            pass
-
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(self._sock_path)
+        if is_tcp_endpoint(self._sock_path):
+            host, port = parse_tcp_endpoint(self._sock_path)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+        else:
+            try:
+                os.unlink(self._sock_path)
+            except FileNotFoundError:
+                pass
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(self._sock_path)
         sock.listen(self._backlog)
         sock.settimeout(0.5)
         self._sock = sock
@@ -180,10 +223,11 @@ class MockHidServer:
             self._accept_thread.join(timeout=1.0)
         for t in self._client_threads:
             t.join(timeout=1.0)
-        try:
-            os.unlink(self._sock_path)
-        except FileNotFoundError:
-            pass
+        if not is_tcp_endpoint(self._sock_path):
+            try:
+                os.unlink(self._sock_path)
+            except FileNotFoundError:
+                pass
 
     def broadcast(self, packet: Packet) -> None:
         with self._lock:

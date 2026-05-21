@@ -11,6 +11,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+target/
+node_modules/
+desktop/src-tauri/gen/
 
 .venv/
 venv/
@@ -18,3 +21,5 @@ venv/
 .DS_Store
 
 /HANDOFF.md
+docs/
+images/
