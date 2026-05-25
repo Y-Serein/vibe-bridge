@@ -8,8 +8,9 @@ use vb_core::{AgentSession, TerminalWindow};
 
 mod agent_discovery;
 pub use agent_discovery::{
-    active_agent_processes, agent_source_roots, ActiveAgentProcess, AgentPollSnapshot,
-    AgentSourcePoller,
+    active_agent_processes, agent_source_roots, line_to_discovered_turn,
+    max_retained_turns_per_agent, ActiveAgentProcess, AgentPollSnapshot, AgentSourcePoller,
+    DiscoveredTurn,
 };
 
 #[cfg(windows)]

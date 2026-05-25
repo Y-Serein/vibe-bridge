@@ -19,6 +19,7 @@ pub enum TerminalKind {
 pub enum AgentKind {
     Claude,
     Codex,
+    Terminal,
     Unknown,
 }
 
@@ -27,6 +28,7 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Terminal => "terminal",
             Self::Unknown => "unknown",
         }
     }
@@ -35,6 +37,7 @@ impl AgentKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" => Self::Claude,
             "codex" | "codex-cli" | "codex-tui" => Self::Codex,
+            "terminal" | "shell" | "vibe-terminal" | "capture-shell" => Self::Terminal,
             _ => Self::Unknown,
         }
     }
@@ -227,5 +230,136 @@ mod tests {
             classify_terminal_process("wps.exe", "hid_vendor_terminal_spec.pdf - WPS Office"),
             TerminalKind::Unknown
         );
+    }
+}
+
+// ============================================================================
+// Board / Agent 跨端通信类型 (M1 起新增)
+// 这些类型被 vb-protocol / vb-transport / vb-agent / vb-daemon 共享。
+// 保持零依赖 (no serde/no_std-compatible style); IPC 序列化在 vb-daemon 那
+// 一层用 serde derive 包一层 wrapper 类型。
+// ============================================================================
+
+/// 板端分配的 session id。0 保留为广播 (与 aikb_hid_input.c SESSION_BROADCAST 对齐)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoardSid(pub u16);
+
+impl BoardSid {
+    pub const BROADCAST: Self = BoardSid(0);
+
+    pub const fn new(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
+    pub const fn is_broadcast(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// 一个 session 的 token / 费用快照, 板端按 sid 显示。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    /// 以分计 (USD cents)。板端显示按需缩放为美元。
+    pub cost_cents: u64,
+}
+
+/// 一轮对话发言。短消息直接板端显示, 长消息分包发 TURN_APPEND。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub sid: BoardSid,
+    pub role: TurnRole,
+    pub text: String,
+    pub ts_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRole {
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+impl TurnRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::System => "system",
+        }
+    }
+}
+
+/// agent 发出的待审批请求 (Claude Code PreToolUse / Codex tool gate 等)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    pub req_id: u64,
+    pub sid: BoardSid,
+    pub tool: String,
+    pub args_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+    Always,
+}
+
+impl PermissionDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub sid: BoardSid,
+    pub level: NotificationLevel,
+    pub text: String,
+    pub ts_ms: u64,
+}
+
+#[cfg(test)]
+mod board_types_tests {
+    use super::*;
+
+    #[test]
+    fn board_sid_broadcast_is_zero() {
+        assert!(BoardSid::BROADCAST.is_broadcast());
+        assert!(!BoardSid::new(1).is_broadcast());
+        assert_eq!(BoardSid::new(42).raw(), 42);
+    }
+
+    #[test]
+    fn turn_role_labels() {
+        assert_eq!(TurnRole::User.as_str(), "user");
+        assert_eq!(TurnRole::Assistant.as_str(), "assistant");
+    }
+
+    #[test]
+    fn permission_decision_labels() {
+        assert_eq!(PermissionDecision::Allow.as_str(), "allow");
+        assert_eq!(PermissionDecision::Deny.as_str(), "deny");
+        assert_eq!(PermissionDecision::Always.as_str(), "always");
     }
 }

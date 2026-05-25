@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use vb_core::{AgentActivity, AgentActivityKind, AgentKind, AgentSession, AgentStatus};
+use vb_core::{AgentActivity, AgentActivityKind, AgentKind, AgentSession, AgentStatus, TurnRole};
 
 const CLAUDE_RECENT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const CODEX_RECENT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
@@ -57,6 +57,18 @@ pub fn agent_source_roots() -> AgentSourceRoots {
 pub struct AgentPollSnapshot {
     pub sessions: Vec<AgentSession>,
     pub activities: Vec<AgentActivity>,
+    /// Conversation turn text extracted from transcript JSONL. Used by daemon
+    /// passive discovery to fill `agent.turns` so the board terminal replay
+    /// shows real conversation content without relying on hook events.
+    pub turns: Vec<DiscoveredTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredTurn {
+    pub kind: AgentKind,
+    pub agent_id: String,
+    pub role: TurnRole,
+    pub text: String,
 }
 
 #[derive(Debug, Default)]
@@ -78,13 +90,28 @@ impl AgentSourcePoller {
         }
     }
 
+    /// 不走 active filter 的快速首扫: 跳过 ToolHelp32 进程枚举和 Windows
+    /// Terminal UIA 检测, 让 daemon 启动时立刻看到所有 transcript 候选。
+    /// 历史 sessions 也会被纳入, 由上层根据真实场景决定是否后续清理。
+    pub fn poll_candidates_once(&mut self) -> Result<AgentPollSnapshot, String> {
+        self.poll_with_sessions(discover_agent_session_candidates()?)
+    }
+
     pub fn poll_once(&mut self) -> Result<AgentPollSnapshot, String> {
         let sessions = if self.include_inactive {
             discover_agent_session_candidates()?
         } else {
             discover_agent_sessions()?
         };
+        self.poll_with_sessions(sessions)
+    }
+
+    fn poll_with_sessions(
+        &mut self,
+        sessions: Vec<AgentSession>,
+    ) -> Result<AgentPollSnapshot, String> {
         let mut activities = Vec::new();
+        let mut turns = Vec::new();
 
         for session in &sessions {
             let seen_key = (session.kind, session.agent_id.clone());
@@ -108,14 +135,27 @@ impl AgentSourcePoller {
                 {
                     activities.push(activity);
                 }
+                if let Some(turn) = line_to_discovered_turn(session.kind, &session.agent_id, line) {
+                    turns.push(turn);
+                }
             }
         }
 
         Ok(AgentPollSnapshot {
             sessions,
             activities,
+            turns,
         })
     }
+}
+
+const MAX_RETAINED_TURNS_PER_AGENT: usize = 50;
+
+/// Cap the rolling turn history kept in memory for each agent. Board terminal
+/// replay only renders the most recent few turns, so unbounded growth from a
+/// long transcript would just burn RAM.
+pub fn max_retained_turns_per_agent() -> usize {
+    MAX_RETAINED_TURNS_PER_AGENT
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,28 +179,73 @@ fn filter_sessions_by_active_counts(
             .then_with(|| b.transcript_path.cmp(&a.transcript_path))
     });
 
-    if counts.is_empty() {
+    // Dedup down to one slot per `(kind, cwd)`. The active scan reports
+    // both parent and forked worker processes for codex (`comm=codex` on
+    // both), which used to produce 2 slots per logical session and led to
+    // two transcript candidates being bound to the same project — board
+    // saw duplicate SIDs that thrashed as different jsonl files won the
+    // race on each tick. One slot per `(kind, cwd)` keeps the SID stable
+    // across ticks; if a user really runs two codex windows in the same
+    // directory we display them as one row, which is the right call for
+    // the rare case.
+    let mut active_slots: Vec<(AgentKind, String)> = counts.into_keys().collect();
+
+    // No active-process evidence at all from any distro — most likely the
+    // wsl.exe scan failed entirely. Fall back to recently-modified-and-not-
+    // done transcripts so the board isn't empty just because process scan
+    // misbehaves. This is the recovery path; normal operation hits the
+    // strict branch below.
+    if active_slots.is_empty() {
         return fallback_recent_active_candidates(candidates);
     }
 
-    let mut counts = counts;
+    // Strict semantic: a transcript candidate must match a live process. If
+    // the process is gone, the session is dropped, regardless of whether the
+    // transcript still says "task_started" with no closing event (Typora-
+    // closed-abruptly is the canonical bug). status=Running in the jsonl
+    // alone is NOT trustworthy — many CLIs never write a `task_complete`
+    // when the user just kills the terminal.
     let mut out = Vec::new();
     for session in candidates {
         let mut session = session;
-        let key = active_key(session.kind, &session.cwd);
-        let Some(count) = counts.get_mut(&key) else {
+        let sess_cwd = normalize_cwd(&session.cwd);
+        let Some(pos) = active_slots.iter().position(|(kind, proc_cwd)| {
+            *kind == session.kind && cwd_prefix_matches(&sess_cwd, proc_cwd)
+        }) else {
             continue;
         };
-        if *count == 0 {
-            continue;
-        }
-        *count -= 1;
-        if session.status == AgentStatus::Done {
-            session.status = AgentStatus::Idle;
+        active_slots.swap_remove(pos);
+        // Process is verifiably alive: pin status to Running, override any
+        // stale Done/Idle/Unknown from the transcript so the board picker
+        // doesn't claim the session is dead. WaitingInput is preserved
+        // because it's specifically a "alive but blocked" signal.
+        if !matches!(session.status, AgentStatus::WaitingInput) {
+            session.status = AgentStatus::Running;
         }
         out.push(session);
     }
     sort_and_dedup_sessions(out)
+}
+
+/// True if `proc_cwd` (where the agent process was launched) and `sess_cwd`
+/// (where the transcript says the agent is working) are on the same branch
+/// of the directory tree — i.e., one is a prefix of the other. This handles
+/// Claude's behavior of overwriting the transcript `cwd` field whenever the
+/// user `cd`s, even though the process itself never moves.
+fn cwd_prefix_matches(sess_cwd: &str, proc_cwd: &str) -> bool {
+    if sess_cwd == proc_cwd {
+        return true;
+    }
+    let with_sep = |s: &str| {
+        if s.ends_with('/') {
+            s.to_string()
+        } else {
+            format!("{s}/")
+        }
+    };
+    let sess = with_sep(sess_cwd);
+    let proc = with_sep(proc_cwd);
+    sess.starts_with(&proc) || proc.starts_with(&sess)
 }
 
 fn fallback_recent_active_candidates(candidates: Vec<AgentSession>) -> Vec<AgentSession> {
@@ -660,6 +745,7 @@ fn line_to_activity(
     let (activity, status) = match kind {
         AgentKind::Codex => codex_line_activity_status(&value)?,
         AgentKind::Claude => claude_line_activity_status(&value)?,
+        AgentKind::Terminal => return None,
         AgentKind::Unknown => return None,
     };
     Some(AgentActivity {
@@ -708,6 +794,138 @@ fn codex_line_activity_status(value: &Value) -> Option<(AgentActivityKind, Agent
     }
 }
 
+pub fn line_to_discovered_turn(
+    kind: AgentKind,
+    agent_id: &str,
+    line: &str,
+) -> Option<DiscoveredTurn> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let (role, text) = match kind {
+        AgentKind::Claude => claude_line_to_turn(&value)?,
+        AgentKind::Codex => codex_line_to_turn(&value)?,
+        AgentKind::Terminal => return None,
+        AgentKind::Unknown => return None,
+    };
+    let text = text.trim();
+    if text.is_empty() || is_pseudo_turn_text(text) {
+        return None;
+    }
+    Some(DiscoveredTurn {
+        kind,
+        agent_id: agent_id.to_string(),
+        role,
+        text: text.to_string(),
+    })
+}
+
+/// Drop synthetic placeholder turns that the agent CLIs emit for non-content
+/// events (turn aborts, interrupts, system notices). They are not real user
+/// or assistant text and must not be surfaced on the board terminal view.
+fn is_pseudo_turn_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "<turn_aborted>"
+            | "<user_interrupt>"
+            | "<system>"
+            | "<interrupted>"
+            | "[turn aborted]"
+            | "[user interrupted]"
+    ) || lower.starts_with("<system>") && lower.ends_with("</system>")
+}
+
+fn claude_line_to_turn(value: &Value) -> Option<(TurnRole, String)> {
+    let kind = value.get("type")?.as_str()?;
+    let message = value.get("message")?;
+    match kind {
+        "user" => extract_message_text(message, false).map(|t| (TurnRole::User, t)),
+        "assistant" => extract_message_text(message, true).map(|t| (TurnRole::Assistant, t)),
+        _ => None,
+    }
+}
+
+fn extract_message_text(message: &Value, skip_tool_use: bool) -> Option<String> {
+    let content = message.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    let items = content.as_array()?;
+    let mut buf = String::new();
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if skip_tool_use && (item_type == "tool_use" || item_type == "tool_result") {
+            continue;
+        }
+        if item_type == "tool_result" {
+            continue;
+        }
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            if !buf.is_empty() {
+                buf.push(' ');
+            }
+            buf.push_str(text);
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
+fn codex_line_to_turn(value: &Value) -> Option<(TurnRole, String)> {
+    let outer_type = value.get("type")?.as_str()?;
+    match outer_type {
+        "event_msg" => {
+            let payload = value.get("payload").unwrap_or(value);
+            let payload_type = payload.get("type")?.as_str()?;
+            let role = match payload_type {
+                "user_message" => TurnRole::User,
+                "agent_message" => TurnRole::Assistant,
+                _ => return None,
+            };
+            let text = payload.get("message")?.as_str()?.to_string();
+            Some((role, text))
+        }
+        "response_item" => {
+            let payload = value.get("payload").unwrap_or(value);
+            if payload.get("type")?.as_str()? != "message" {
+                return None;
+            }
+            let role = match payload.get("role").and_then(Value::as_str)? {
+                "user" => TurnRole::User,
+                "assistant" => TurnRole::Assistant,
+                _ => return None,
+            };
+            let content = payload.get("content")?;
+            if let Some(s) = content.as_str() {
+                return Some((role, s.to_string()));
+            }
+            let items = content.as_array()?;
+            let mut buf = String::new();
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                let is_text = matches!(item_type, "input_text" | "output_text" | "text");
+                if !is_text {
+                    continue;
+                }
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(text);
+                }
+            }
+            if buf.is_empty() {
+                None
+            } else {
+                Some((role, buf))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn claude_line_activity_status(value: &Value) -> Option<(AgentActivityKind, AgentStatus)> {
     let status = claude_status(value)?;
     let activity = match status {
@@ -731,7 +949,11 @@ fn read_appended_lines(
     let len = fs::metadata(path)
         .map_err(|err| format!("stat {}: {err}", path.display()))?
         .len();
-    let offset = cursors.entry(path.to_path_buf()).or_insert(len);
+    // First time we see a transcript, read it from the beginning so passive
+    // discovery captures all already-recorded turns (board terminal replay
+    // needs history, not just future appends). Subsequent polls advance the
+    // cursor and only read new bytes.
+    let offset = cursors.entry(path.to_path_buf()).or_insert(0);
     if len < *offset {
         *offset = len;
         return Ok(None);
@@ -826,20 +1048,89 @@ fn wsl_home_dirs_from_wsl_exe() -> Vec<PathBuf> {
 }
 
 fn active_wsl_agent_processes() -> Vec<ActiveAgentProcess> {
+    let debug = std::env::var_os("VIBE_BRIDGE_SCAN_DEBUG").is_some();
+    // Base64-encode the scan script and pipe it through `base64 -d | sh` on
+    // the Linux side. This bypasses every layer of Windows argv quoting
+    // (`Command::new`, CreateProcessW, wsl.exe's own parser) — we discovered
+    // that passing the multi-line POSIX script directly via
+    // `wsl.exe -d <distro> sh -lc <script>` silently produced an empty stdout
+    // even though the same script ran fine inside the WSL shell. The
+    // failure mode is: the wsl.exe arg parser collapsed/escaped the embedded
+    // quotes and the script reaching bash was effectively a no-op.
+    let encoded = base64_encode_bytes(ACTIVE_AGENT_PROCESS_SCRIPT.as_bytes());
+    let wrapper = format!("echo {encoded} | base64 -d | sh");
+
     let mut processes = Vec::new();
     for distro in wsl_distro_names() {
         let output = Command::new("wsl.exe")
-            .args(["-d", &distro, "sh", "-lc", ACTIVE_AGENT_PROCESS_SCRIPT])
+            .args(["-d", &distro, "--", "sh", "-lc", &wrapper])
             .output();
-        let Ok(output) = output else {
-            continue;
+        let output = match output {
+            Ok(o) => o,
+            Err(err) => {
+                if debug {
+                    eprintln!("[scan] wsl.exe -d {distro}: spawn failed: {err}");
+                }
+                continue;
+            }
         };
         if !output.status.success() {
+            if debug {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!(
+                    "[scan] wsl.exe -d {distro}: exit {:?} stderr={stderr}",
+                    output.status.code()
+                );
+            }
             continue;
         }
-        processes.extend(parse_active_agent_process_output(&output.stdout));
+        let parsed = parse_active_agent_process_output(&output.stdout);
+        if debug {
+            let preview: String = String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(160)
+                .collect();
+            eprintln!(
+                "[scan] {distro}: {} agent process(es) [stdout {} bytes]: {:?}",
+                parsed.len(),
+                output.stdout.len(),
+                parsed
+                    .iter()
+                    .map(|p| format!("{}:{}", p.kind.as_str(), p.cwd))
+                    .collect::<Vec<_>>()
+            );
+            if !output.stdout.is_empty() {
+                eprintln!("[scan]   stdout preview: {preview:?}");
+            }
+        }
+        processes.extend(parsed);
     }
     processes
+}
+
+/// Tiny std-only base64 encoder; we don't want a new dep just to pipe a
+/// scan script through wsl.exe. RFC 4648 alphabet, padded.
+fn base64_encode_bytes(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn active_unix_agent_processes() -> Vec<ActiveAgentProcess> {
@@ -1143,7 +1434,12 @@ mod tests {
     }
 
     #[test]
-    fn active_filter_limits_sessions_by_running_process_count_per_cwd() {
+    fn active_filter_picks_one_session_per_cwd_even_with_multiple_processes() {
+        // Active scan returns the count of processes at each (kind, cwd) —
+        // including codex's fork-worker pairs, which used to allocate 2
+        // slots per logical session and produced duplicate SIDs. Slot dedup
+        // now collapses to 1 per (kind, cwd); only the newest transcript
+        // candidate wins, keeping the board SID stable.
         let candidates = vec![
             test_session(
                 "old",
@@ -1172,6 +1468,8 @@ mod tests {
             ),
         ];
         let mut counts = HashMap::new();
+        // Even with 3 process entries (e.g., codex parent + 2 children),
+        // we should still only register 1 session for this cwd.
         counts.insert((AgentKind::Codex, "/home/rv_nano".to_string()), 3);
 
         let filtered = filter_sessions_by_active_counts(candidates, counts);
@@ -1180,17 +1478,18 @@ mod tests {
             .map(|session| session.agent_id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids.len(), 3);
+        // Only the single newest jsonl wins the (kind, cwd) slot.
+        assert_eq!(ids.len(), 1);
         assert!(ids.contains(&"new-1"));
-        assert!(ids.contains(&"new-2"));
-        assert!(ids.contains(&"new-3"));
+        assert!(!ids.contains(&"new-2"));
+        assert!(!ids.contains(&"new-3"));
         assert!(!ids.contains(&"old"));
         assert!(!ids.contains(&"other"));
-        let idle_session = filtered
+        let alive = filtered
             .iter()
-            .find(|session| session.agent_id == "new-2")
+            .find(|session| session.agent_id == "new-1")
             .unwrap();
-        assert_eq!(idle_session.status, AgentStatus::Idle);
+        assert_eq!(alive.status, AgentStatus::Running);
     }
 
     #[test]
@@ -1230,10 +1529,13 @@ mod tests {
             .map(|session| session.agent_id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids.len(), 3);
+        // Even though 2 terminal titles match /home/rv_nano (rv-new and
+        // rv-idle were both viable candidates), slot dedup picks just one
+        // — the most recently modified jsonl. Typora is its own (kind, cwd).
+        assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"rv-new"));
-        assert!(ids.contains(&"rv-idle"));
         assert!(ids.contains(&"typora"));
+        assert!(!ids.contains(&"rv-idle"));
         assert!(!ids.contains(&"old"));
     }
 
@@ -1278,10 +1580,13 @@ mod tests {
             .map(|session| session.agent_id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids.len(), 3);
+        // Plain-shell titles (powershell / npm / ESP-IDF) are still filtered
+        // out so they don't poison cwd matching. Slot dedup then collapses
+        // the remaining rv_nano titles to a single SID.
+        assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"rv-new"));
-        assert!(ids.contains(&"rv-idle"));
         assert!(ids.contains(&"typora"));
+        assert!(!ids.contains(&"rv-idle"));
         assert!(!ids.contains(&"rv-third"));
     }
 
@@ -1335,11 +1640,16 @@ mod tests {
             .map(|session| session.agent_id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids.len(), 4);
+        // Two codex titles map to /home/rv_nano (rv-new and rv-idle), the
+        // generic "✳ Claude Code" title matches the claude session at the
+        // vibe-bridge cwd, and "Typora" matches its codex. After slot dedup
+        // we end up with one row per (kind, cwd): codex /home/rv_nano,
+        // codex Typora, claude vibe-bridge.
+        assert_eq!(ids.len(), 3);
         assert!(ids.contains(&"rv-new"));
-        assert!(ids.contains(&"rv-idle"));
         assert!(ids.contains(&"typora"));
         assert!(ids.contains(&"claude-code"));
+        assert!(!ids.contains(&"rv-idle"));
         assert!(!ids.contains(&"old"));
     }
 
@@ -1360,6 +1670,90 @@ mod tests {
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
+    }
+
+    #[test]
+    fn claude_user_string_content_becomes_turn() {
+        let turn = line_to_discovered_turn(
+            AgentKind::Claude,
+            "claude-1",
+            r#"{"type":"user","message":{"role":"user","content":"hello board"}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.role, TurnRole::User);
+        assert_eq!(turn.text, "hello board");
+    }
+
+    #[test]
+    fn claude_assistant_array_content_skips_tool_use() {
+        let turn = line_to_discovered_turn(
+            AgentKind::Claude,
+            "claude-1",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.role, TurnRole::Assistant);
+        assert_eq!(turn.text, "ok");
+    }
+
+    #[test]
+    fn claude_assistant_tool_only_message_is_skipped() {
+        assert!(line_to_discovered_turn(
+            AgentKind::Claude,
+            "claude-1",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_event_msg_user_message_becomes_turn() {
+        let turn = line_to_discovered_turn(
+            AgentKind::Codex,
+            "codex-1",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"please run tests"}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.role, TurnRole::User);
+        assert_eq!(turn.text, "please run tests");
+    }
+
+    #[test]
+    fn codex_event_msg_agent_message_becomes_turn() {
+        let turn = line_to_discovered_turn(
+            AgentKind::Codex,
+            "codex-1",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"tests pass"}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.role, TurnRole::Assistant);
+        assert_eq!(turn.text, "tests pass");
+    }
+
+    #[test]
+    fn codex_response_item_message_content_array_becomes_turn() {
+        let turn = line_to_discovered_turn(
+            AgentKind::Codex,
+            "codex-1",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"},{"type":"function_call"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.role, TurnRole::Assistant);
+        assert_eq!(turn.text, "hello");
+    }
+
+    #[test]
+    fn non_turn_lines_return_none() {
+        assert!(
+            line_to_discovered_turn(AgentKind::Claude, "claude-1", r#"{"type":"progress"}"#,)
+                .is_none()
+        );
+        assert!(line_to_discovered_turn(
+            AgentKind::Codex,
+            "codex-1",
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","status":"ok"}}"#,
+        )
+        .is_none());
     }
 
     fn test_session(agent_id: &str, cwd: &str, transcript_path: &str) -> AgentSession {

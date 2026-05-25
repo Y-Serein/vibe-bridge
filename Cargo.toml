@@ -2,6 +2,10 @@
 resolver = "2"
 members = [
     "crates/vb-core",
+    "crates/vb-protocol",
+    "crates/vb-transport",
+    "crates/vb-platform",
+    "crates/vb-agent",
     "crates/vb-daemon",
     "crates/vb-host",
 ]

@@ -1,0 +1,12 @@
+[package]
+name = "vb-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vb-core = { path = "../vb-core" }
+
+[lib]
+name = "vb_agent"
+path = "src/lib.rs"

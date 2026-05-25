@@ -15,6 +15,7 @@
 辅助工具：
 
 - 开工前优先运行只读 preflight：`python3 /home/rv_nano/Sipeed/T_tools/agent_preflight.py --project vibe-bridge`。
+- 用户要求接手、先看看、对齐需求、以结果为导向、可反驳、先不要改代码时，优先读取 `/home/rv_nano/Sipeed/.claude/skills/project-intake/SKILL.md`。
 - host/daemon/session/HID/board 协议任务优先读取 `/home/rv_nano/Sipeed/.claude/skills/rv-nano-vibe-tools/SKILL.md`。
 - 遇到重复问题先查 `/home/rv_nano/Sipeed/C_context/KNOWN_FAILURES.md`。
 
