@@ -1,5 +1,121 @@
 # vibe-bridge Memory
 
+## 2026-05-27 AIKB 板端 UI / sleep / 900M rootfs 复盘
+
+### 当前状态记忆
+
+- 本轮主线是板端，不是上位机：AIKB UI 统一、boot 动画删除、sleep 动画接入、rootfs 缩到 900M，并补项目定义文档。
+- 板端仓库是 `/home/rv_nano/AIKB/LicheeRV-Nano-Build`；项目文档和 memory 放在 `/home/rv_nano/Sipeed/rv_nano/tools/vibe-bridge/C_context`。
+- 用户已经烧录验证过上一版“挺正常”，但本轮最终改动尚未由用户重新 `pack_rootfs && pack_burn_image`、烧录和上板验证。
+- 用户明确保留打包镜像权限：agent 不运行 `pack_rootfs && pack_burn_image`，只把代码/配置做到可编译。
+- 目标镜像不是越小越好，而是在稳定性有余量的前提下，从约 1.6G 收敛到 900M rootfs / 约 916MiB burn image，满足约 1GB TF / SD NAND 方向。
+
+### 用户偏好
+
+- 默认中文，简洁但要有证据；结论要区分“已验证”和“未验证”。
+- 用户希望按“目标→状态→误差→控制动作→反馈→修正→验证→沉淀”闭环推进，尤其在嵌入式、镜像、硬件相关任务中。
+- 用户反复强调不要大改架构。UI 优化要尽量保持已有实现和产品行为稳定。
+- 用户不接受 UI 标题自动替换：按键按下后左上角应显示对应主题标题，不应几秒后从 `VOICE` 变成 `LISTEN`、从 `RUN` 变成 `UPDATING`。
+- 用户更在意产品语义一致性：`RUN` 页面不能显示 OTA、updating、progress 这类旧语义。
+- 用户要求文档放在 `Sipeed/rv_nano/tools/vibe-bridge/C_context`，不要放 AIKB。
+- 用户说“内存小一点”时要先确认语义；这次指 TF / SD NAND 存储容量，不是 256MB DDR。
+- 用户需要 3 天后 30 秒接续，HANDOFF 顶部必须写清目标、状态、误差、动作、验证、下一步和不要重复的坑。
+
+### 从错误里学到的最佳实践
+
+- 不要越权运行用户明确保留的高风险命令。`pack_rootfs && pack_burn_image` 会生成生产镜像，必须由用户执行。
+- 不要把“配置改到 900M”说成“已生成 900M 新镜像”。没有 pack 就没有新镜像。
+- 缩镜像时先区分三件事：分区 XML 决定 burn image 布局，Buildroot ext4 size 决定 rootfs 文件系统大小，post-build prune 决定 rootfs 内容大小。
+- 1GB 介质要按十进制 1GB 预留空间，960M rootfs 太贴边；900M rootfs 更稳。
+- 动画文件可能用 mmap 播放，占用存储不等于常驻 DDR；删除 boot 动画主要缩镜像，不应宣称显著降低运行内存。
+- 屏幕测试版本只能临时用于显示验证，用户测试完必须恢复正常系统启动。
+- 资源裁剪必须基于引用审计：`/mnt/system/auto.sh`、板端 C 程序、overlay、target/install rootfs 之间容易漂移。
+
+### 项目关键约束和坑
+
+- 板端可提交源码/配置/overlay/sample binary；生成产物、`.d` 依赖文件、rootfs 镜像不要默认提交。
+- `buildroot/board/cvitek/SG200X/overlay/mnt/system/auto.sh` 是板端启动体验关键入口，boot/sleep/UI 参数都从这里接入。
+- `aikb_lcd_ui` 负责本地 UI、pet/terminal/session/picker/sleep；`aikb_hid_input` 负责 HID/session/key/event 桥接。不要把标题/UI 问题误判为 host session 问题。
+- boot 动画 `vedio_start.akim` 已被删除；sleep 动画 `vedio_sleep.akim` 是保留并启用的资源。
+- 非 session 页面才允许 idle sleep；terminal/session picker 页面不能被 sleep 动画盖住。
+- rootfs 900M 依赖两处一致：`partition_sd.xml` 的 `ROOTFS=921600KB` 和 Buildroot `BR2_TARGET_ROOTFS_EXT2_SIZE="900M"`。
+- AIKB 当前运行链路是 BusyBox/C 程序为主；Python/Qt/OpenCV/ffmpeg/gdb/vim/demo model 是本轮裁剪对象，但未来如果引入依赖必须重新审计。
+
+### 下次一次性达到目标的提示词
+
+```text
+接手 AIKB 板端 UI / rootfs 优化，按“目标→状态→误差→控制动作→反馈→修正→验证→沉淀”闭环推进。先读 /home/rv_nano/AIKB/AGENTS.md、CLAUDE.md、HANDOFF.md、C_context/KNOWN_FAILURES.md，以及 /home/rv_nano/Sipeed/rv_nano/tools/vibe-bridge/C_context/MEMORY.md，并运行 /home/rv_nano/Sipeed/T_tools/agent_preflight.py --project AIKB 或项目规则指定的 preflight。
+
+约束：板端是重点；尽量不改架构；不要运行 pack_rootfs && pack_burn_image，这一步由我来跑；不要把文档放 AIKB，文档和复盘放到 Sipeed/rv_nano/tools/vibe-bridge/C_context。
+
+当前产品要求：UI 标题按键后保持对应主题，不要几秒后自动变成内部状态名；RUN 页面只显示 running 语义，不显示 OTA/updating/progress；删除 boot 动画；非 session 页面 3 分钟无按键进入 sleep；镜像目标 900M rootfs，兼容约 1GB TF / SD NAND，但要保留稳定余量。
+
+验证要求：只做静态检查、最小编译或语法检查；明确告诉我哪些未上板验证。结束时更新 HANDOFF 顶部 30 秒接续、C_context/MEMORY.md，并把流程/坑沉淀进 skill。
+```
+
+### 已沉淀为 skill
+
+- 新增项目 skill：`C_context/skills/aikb-board-control-loop/SKILL.md`。
+- 下次处理 AIKB 板端 UI、AKIM、sleep、rootfs、镜像大小、LicheeRV-Nano-Build 打包边界时应优先使用。
+
+## 2026-05-26 上位机产品收尾复盘：native WSL 与安装包边界
+
+### 当前状态记忆
+
+- direct Ubuntu -> `codex` 已由用户实测确认效果较好，这是当前产品链路里最接近目标的路径。
+- 上位机本轮重点是 Windows Terminal 中 `wsl -> codex` 的 native 体验：host 终端样式、颜色、回滚不能被捕获层破坏。
+- 当前正确策略：普通 `wsl` 保持 native passthrough，进入 WSL 后由 shell-integration 的 `codex` / `claude` shim 捕获。不要继续用双层 ConPTY/transient shim 硬包 `wsl`。
+- 新 `VibeBridgeSetup.exe` 尚未重建。WSL 环境缺 `x86_64-w64-mingw32-gcc`，也没有可用 `powershell.exe` / `cargo.exe`。当前 `D_deliverables/windows/VibeBridgeSetup.exe` 是旧包，不能用于验证本轮 host 修正。
+- 板端 SESSION/scrollback 细节已沉淀到 `/home/rv_nano/AIKB/HANDOFF.md` 和 `/home/rv_nano/AIKB/C_context/MEMORY.md`，不要在上位机 memory 中展开维护。
+
+### 用户偏好
+
+- 用户要成品产品感，不要 demo 感：类似驱动/Typora 安装体验，安装、修复、卸载清晰，后台常驻，卸载后不影响系统。
+- 用户非常在意“原生态终端体验”。如果捕获策略让 Windows Terminal 回滚、样式、颜色、交互不像原生，即使板端能看到，也不是合格默认方案。
+- 用户不接受“只能通过我指定入口打开”的局限。direct Ubuntu、Windows Terminal 里输入 `wsl`、再运行 `codex`，都应尽量覆盖。
+- 用户反复要求不要破坏正常 `codex` / `claude`。不要覆盖 `~/.local/bin/codex` / `~/.local/bin/claude`；shell integration 应只前置自己的 shim 目录，并能卸载恢复。
+- 用户希望我能反驳，但必须给证据和替代方案利弊。本轮应明确反驳“继续包一层 terminal-shim 就能修好 wsl 样式”：它会和 native scrollback/style 目标冲突。
+- 用户希望我主动说明未验证项。尤其不能把“代码通过 check”说成“安装包已可用”，也不能把旧 exe 当新包。
+- 用户希望交接文件顶部 30 秒可接续：目标、当前状态、误差、控制动作、验证、未完成、下一步、不要重复的坑都要写明。
+
+### 从错误里学到的最佳实践
+
+- 不要把“能捕获”误当成“产品体验好”。捕获层如果改坏终端原始样式/回滚，就要降级为显式入口，而不是默认入口。
+- 对 `wsl -> codex`，更稳的默认策略是：`wsl.cmd` passthrough 到 `wsl.exe`；进入 WSL 后由 shell-integration 捕获 agent。不要再默认 nested ConPTY 捕获整个 `wsl`。
+- 修安装器策略后，必须同步修脚本输出文案。否则用户会按旧“wraps Windows Terminal profiles”理解产品行为。
+- 生成/验证 Windows 安装包必须在 native Windows 或有 mingw linker 的环境完成。WSL 里 `cargo check --target x86_64-pc-windows-gnu` 通过不等于能 release link 出 exe。
+- 修改产品默认策略后，必须配套更新 setup 输出文案、Start Menu 行为和卸载/修复路径，避免用户按旧语义测试。
+
+### 项目关键约束和坑
+
+- Host repo：`/home/rv_nano/Sipeed/rv_nano/tools/vibe-bridge`。
+- 用户实际 Windows 项目目录：`C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge`。agent 侧不要直接假设可通过 Windows 路径访问，优先 WSL 路径。
+- 产品默认不应 wrapper Windows Terminal profiles；需要显式 captured WSL shortcut 时，放在 `vibe-bridge` 子菜单，不覆盖 direct Ubuntu/WSL 入口。
+- Windows 安装/修复应恢复 native Windows Terminal profile；卸载也必须恢复 terminal/profile/startup/shims/shell integration。
+- WSL shell integration 当前应安装到 `~/.local/share/vibe-bridge/shell-integration/bin/{codex,claude}`，并通过 marker block 管理 PATH。不要移动真实 CLI，不要写坏 `real-bin`。
+- Board-assigned SID 仍是权威；host 不能自造最终 sid。
+- 当前未完成项：Windows 新 setup exe 未重建；native Windows install/repair 未实测。
+
+### 下次一次性达到目标的提示词
+
+```text
+接手 vibe-bridge 产品收尾，按“目标→状态→误差→控制动作→反馈→修正→验证→沉淀”闭环推进。先读 AGENTS.md、HANDOFF.md、C_context/MEMORY.md、C_context/KNOWN_FAILURES.md，并运行对应 agent_preflight.py。先汇报状态，再做最小改动。
+
+当前事实：direct Ubuntu -> codex 已经比较好；不要从“完全没捕获”重新排查。当前重点是上位机产品体验一致性：Windows Terminal 中 wsl -> codex 要保持 native WSL 样式和回滚，同时 WSL shell-integration 仍能让 Codex 注册到 daemon。
+
+策略边界：不要默认 wrapper Windows Terminal profiles；不要覆盖 ~/.local/bin/codex 或 ~/.local/bin/claude；普通 wsl.cmd 应 passthrough 到 wsl.exe，进入 WSL 后由 shell-integration 的 codex/claude shim 捕获。需要 captured WSL 的入口只能作为显式 Start Menu 子菜单入口，不要覆盖原始 Ubuntu/WSL 入口。
+
+验证要求：host 侧跑 cargo fmt/test/check 和 Windows target check。不要把旧 D_deliverables/windows/VibeBridgeSetup.exe 当新包；如果 WSL 不能 link Windows exe，明确要求我在 native Windows PowerShell 运行 .\T_tools\build_windows_product.ps1。
+
+结束时更新 HANDOFF.md 顶部 30 秒接续段和 C_context/MEMORY.md；列出未验证项、用户下一步命令、预期结果和失败分支。
+```
+
+### 已沉淀为上位机 skill
+
+- 项目 skill：`C_context/skills/vibe-bridge-control-loop/SKILL.md`。
+- 本轮已要求补充 native WSL/product install 规则；下次处理 vibe-bridge Windows daemon、WSL shell integration、安装包收尾时应优先使用。
+- 不要同步到全局 `~/.codex/skills`，除非用户明确要求；这是上位机项目级 skill。
+
 ## 2026-05-24 合作复盘：停止盲猜，沉淀板端空屏阶段
 
 ### 当前状态记忆

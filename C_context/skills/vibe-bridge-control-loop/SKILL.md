@@ -1,6 +1,6 @@
 ---
 name: vibe-bridge-control-loop
-description: Use this skill whenever taking over vibe-bridge, debugging WSL/Windows daemon/HID/session issues, recovering codex or claude after wrapper breakage, or designing terminal mirroring for the AIKB board. It forces a control-loop workflow, protects normal codex/claude startup, separates passive discovery from true PTY/ConPTY terminal capture, and preserves handoff/memory for 3-day continuity.
+description: Use this skill whenever taking over vibe-bridge, debugging WSL/Windows daemon/HID/session issues, recovering codex or claude after wrapper breakage, designing terminal mirroring for the AIKB board, productizing the Windows VibeBridgeSetup.exe installer, or polishing direct Ubuntu / wsl -> codex flows. It forces a control-loop workflow, protects native terminal behavior and normal codex/claude startup, separates passive discovery from true PTY/ConPTY terminal capture, preserves board-assigned SID rules, and maintains HANDOFF/MEMORY for 3-day continuity.
 ---
 
 # Vibe Bridge Control Loop
@@ -12,6 +12,7 @@ Use this skill for `vibe-bridge` work involving Windows daemon, WSL distros, Cod
 The product goal is not "find a session" or "show a summary". The observable goal is:
 
 - normal `codex` / `claude` startup remains intact;
+- native Windows Terminal / Ubuntu / WSL behavior remains intact unless the user chooses an explicit captured shortcut;
 - board session count does not churn or climb unexpectedly;
 - when terminal mirroring is claimed, the board receives real PTY/ConPTY VT100 bytes, not transcript summaries;
 - Claude permission approval remains a separate hook-driven allow/deny path.
@@ -68,7 +69,8 @@ Always report in this shape before editing:
 
 ## Architecture Rules
 
-- Do not default to WSL wrapper installation. `install-windows` must not modify `~/.local/bin/codex` or `~/.local/bin/claude` unless the user explicitly chooses an opt-in WSL install path.
+- Do not default to destructive WSL wrapper installation. `install-windows` / product setup must not modify `~/.local/bin/codex` or `~/.local/bin/claude`.
+- If WSL shell integration is required, install shims under `~/.local/share/vibe-bridge/shell-integration/bin/{codex,claude}` and manage PATH with a marker block. Do not move the real CLIs.
 - Treat Windows native daemon as the product HID owner. WSL is a development/test/control environment, not the default HID owner.
 - Treat board-assigned SID as authoritative. Host code must not invent final SIDs.
 - Do not conflate these three channels:
@@ -79,6 +81,27 @@ Always report in this shape before editing:
 - Claude hook may be installed for permission approval, but do not use hook installation as a reason to replace the `claude` binary.
 - Codex currently has no confirmed Claude-style `PreToolUse` hook in this project. A normal Codex session without capture may not be real-time discoverable or controllable.
 - A network gateway/API proxy can help with semantic messages, token usage, auditing, or permission metadata, but it cannot reconstruct terminal TUI state. Do not present gateway interception as a replacement for PTY/ConPTY VT100 capture.
+
+## Product Installer And Native WSL Rules
+
+Use this section when the user asks for a polished `.exe`, install/repair/uninstall, direct Ubuntu, or `wsl -> codex` behavior.
+
+- Default product install should preserve native Windows Terminal behavior. Do not default to wrapping all Windows Terminal profiles if the user is optimizing for native scrollback, colors, and style.
+- If old versions wrapped profiles, install/repair should restore native Windows Terminal profiles unless the user explicitly asks for captured profiles.
+- `%LOCALAPPDATA%\vibe-bridge\bin\wsl.cmd` should passthrough to `wsl.exe` by default. Let the WSL shell-integration `codex` / `claude` shim capture the agent inside WSL.
+- Keep explicit captured WSL entry points separate, e.g. Start Menu `vibe-bridge` subfolder shortcuts. Do not overwrite direct `Ubuntu.lnk` / `Ubuntu-22.04.lnk`; if an old version backed them up, restore the `.vibe-bridge-backup`.
+- A stale `D_deliverables/windows/VibeBridgeSetup.exe` is a real risk. If code changed and the Windows exe was not rebuilt, say so clearly. Do not let the user test an old setup binary as if it included the fix.
+- WSL `cargo check --target x86_64-pc-windows-gnu` proves type checking, not release linking. A real Windows setup exe requires native Windows Cargo or a working mingw linker such as `x86_64-w64-mingw32-gcc`.
+
+Native Windows rebuild command to give the user when WSL cannot link:
+
+```powershell
+cd C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge
+.\T_tools\build_windows_product.ps1
+.\D_deliverables\windows\VibeBridgeSetup.exe
+```
+
+After install/repair, tell the user to open a new terminal. Existing shells do not reload PATH/profile changes.
 
 ## Terminal Capture Failure Triage
 
@@ -204,7 +227,12 @@ Use the smallest validation that proves the current claim:
   - `cargo fmt --package vb-daemon --check`
   - `cargo test -p vb-daemon`
   - `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`
+  - `cargo check -p vb-transport --target x86_64-pc-windows-gnu` when HID transport changed
   - `git diff --check -- <touched-files>`
+- Windows product artifact:
+  - native Windows: `.\T_tools\build_windows_product.ps1`
+  - expected output: `D_deliverables\windows\VibeBridgeSetup.exe` timestamp/hash updates after the fix
+  - do not claim rebuilt if WSL lacks `x86_64-w64-mingw32-gcc`
 - Windows install behavior:
   - user-run `cargo run -p vb-daemon -- install-windows`
   - expected: `wsl install: skipped`
@@ -227,6 +255,7 @@ At the end of a long session, update:
 
 - `HANDOFF.md` top section with:
   - 30-second current state;
+  - goal, status, error, control action, validation, remaining risk, next user command;
   - latest user-tested facts;
   - next smallest closed loop;
   - explicit "do not repeat" pitfalls.

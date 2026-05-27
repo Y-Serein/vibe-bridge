@@ -1,5 +1,298 @@
 # vibe-bridge HANDOFF
 
+## 2026-05-27 AIKB 板端当前 session 30 秒接续
+
+### 目标
+
+- 板端产品目标：AIKB 上电后直接进入可用体验，UI 主题统一，按键标题稳定，非 session 页面 3 分钟无按键进入 sleep，镜像可压到适配约 1GB TF / SD NAND 的尺寸。
+- 本轮交付目标：保留现有实现框架，不跑 `pack_rootfs && pack_burn_image`，只把代码、配置、文档和交接状态做到用户可自行编译打包。
+
+### 状态
+
+- 板端仓库：`/home/rv_nano/AIKB/LicheeRV-Nano-Build`。
+- 上位机/文档仓库：`/home/rv_nano/Sipeed/rv_nano/tools/vibe-bridge`。
+- 用户已上板确认上一版“挺正常”；之后本轮又做了 UI、sleep、rootfs 900M 和资源裁剪，但尚未由用户重新打包烧录验证。
+- 用户明确约束：`pack_rootfs && pack_burn_image` 只能由用户运行；agent 不要跑、也不要试图代跑。
+- 标准用户编译命令仍是：
+  ```bash
+  apptainer exec --cleanenv host/ubuntu/licheervnano-build-ubuntu.sqfs bash -lc \
+  'cd /home/rv_nano/AIKB/LicheeRV-Nano-Build && source build/cvisetup.sh && defconfig sg2002_licheervnano_sd && pack_rootfs && pack_burn_image'
+  ```
+
+### 误差
+
+- 旧 UI 会把按键标题几秒后替换成场景标题，例如 `VOICE` 变 `LISTEN`，用户明确不需要这种自动替换。
+- `RUN` 页面仍出现 OTA / updating / progress / agent task 等旧语义，和当前产品语义不一致。
+- boot 动画没有产品必要性，占用约 145 MiB，用户要求删除；sleep 动画已存在但未接入。
+- 原镜像输出固定约 1.6G，不适合 1GB TF / SD NAND；需要区分“存储容量”与“256MB DDR 内存”，本轮缩的是镜像/存储占用，不改变运行内存目标。
+
+### 控制动作
+
+- UI：
+  - 按键后左上角保持对应按键标题，不再 8 秒后自动变成 `LISTEN` / `UPDATING` 等内部场景名。
+  - `RUN` 页面标题统一为 `[ RUNNING ]`，移除 OTA/progress 视觉语义。
+  - footer 改为更克制的文字布局，替掉原来较粗糙的三个图标。
+  - 新 session 创建后立即选中新 sid，避免确认后仍停留在旧选择状态。
+- 动画/电源体验：
+  - 禁用并删除 `vedio_start.akim` boot 动画。
+  - 接入 `vedio_sleep.akim`：非 session 页面、3 分钟无本地按键进入 sleep 动画；session picker / terminal 页面不进入 sleep。
+- 镜像尺寸：
+  - `ROOTFS` 分区从 `1638400KB` 改为 `921600KB`。
+  - Buildroot ext4 从 `1600M` 改为 `900M`。
+  - 新增 `aikb_post_build_prune.sh`，在 rootfs post-build 阶段删除当前 AIKB 运行不需要的 Python、Qt、OpenCV、ffmpeg、gdb、vim、demo model、udev hwdb、字体/图标等大体积内容。
+- 文档：
+  - 项目定义文档放在 `vibe-bridge/C_context/AIKB_Project_Definition.md`，不放 AIKB 仓库。
+  - 本轮偏好、踩坑和提示词写入 `vibe-bridge/C_context/MEMORY.md`。
+  - 板端接手流程沉淀为 `vibe-bridge/C_context/skills/aikb-board-control-loop/SKILL.md`。
+
+### 验证
+
+- 已运行 `sh -n buildroot/board/cvitek/SG200X/aikb_post_build_prune.sh`：通过。
+- 已运行 `git diff --check`：板端仓库通过。
+- 已确认 target 侧裁剪后约 `571M`，900M rootfs 仍留有余地。
+- 已做静态尺寸推算：`BOOT 80960KB + ROOTFS 921600KB`，最终 burn image 预期约 `916 MiB`，通常可落在十进制 1GB 存储介质内。
+- 未运行 `pack_rootfs && pack_burn_image`，这是刻意遵守用户约束。
+- 未上板验证本轮最终 UI/sleep/900M 镜像。
+
+### 下一步
+
+1. 用户在板端仓库运行标准 apptainer 打包命令，生成新 `.img`。
+2. 确认新镜像文件大小约 916 MiB 量级，而不是旧的 1.6G。
+3. 烧录后验证：
+   - 上电无 boot 动画。
+   - 非 session 页面 3 分钟无按键进入 sleep。
+   - 按 `VOICE` / `RUN` / `CONFIRM` 后左上角标题不再自动变成内部场景名。
+   - `RUN` 页面只表达 running，不再出现 OTA/update/progress 语义。
+   - Codex/terminal session 仍可进入并显示，不被 sleep 覆盖。
+4. 板上检查：
+   ```sh
+   df -h
+   tail -n 120 /tmp/aikb_lcd_ui.log
+   ```
+
+### 不要重复的坑
+
+- 不要由 agent 运行 `pack_rootfs && pack_burn_image`；这是用户明确保留的高风险步骤。
+- 不要把 1GB TF / SD NAND 存储问题说成 256MB DDR 内存问题。
+- 不要宣称“新镜像已生成/已烧录/已验证”，除非用户实际打包烧录并反馈。
+- 不要把文档放到 AIKB 仓库；用户明确要求放在 `Sipeed/rv_nano/tools/vibe-bridge/C_context`。
+- 不要为了缩小镜像随意裁剪 `/mnt/system/auto.sh` 实际依赖的运行链路；先做资源引用审计，再删。
+- 不要把屏幕测试临时版本留在产品代码里；测试后必须恢复正常系统启动。
+
+## 2026-05-26 上位机当前 session 30 秒接续
+
+### 目标
+
+- 产品目标：`VibeBridgeSetup.exe` 安装/修复后后台常驻；普通 direct Ubuntu、Windows Terminal 中 `wsl -> codex`、`claude`/`codex` 不改变用户使用习惯。
+- 当前这轮上位机目标：修复 `wsl -> codex` host 终端样式/回滚不原生的问题，并把安装/修复策略收敛到 native Windows Terminal + WSL shell-integration。
+
+### 状态
+
+- 用户已确认：direct Ubuntu -> `codex` 当前效果“挺好/非常好”；板端能接 session。
+- host repo：`/home/rv_nano/Sipeed/rv_nano/tools/vibe-bridge`。
+- Windows 实际项目路径：`C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge`；但 agent 侧优先用 WSL 路径访问。
+- 板端本轮状态另见：`/home/rv_nano/AIKB/HANDOFF.md`。
+
+### 误差
+
+- `wsl -> codex` 如果继续双层 ConPTY/transient shim，会破坏 Windows Terminal 原生样式和回滚；正确策略是 `wsl.cmd` 原生透传，WSL 内 shell-integration 捕获 agent。
+
+### 控制动作
+
+- host：
+  - `install-product` 默认改为 `--no-terminal-profiles`，不再默认包 Windows Terminal profile。
+  - install/repair 默认恢复 native Windows Terminal profile。
+  - `wsl.cmd` 改为 native passthrough；由 WSL shell-integration 的 `codex`/`claude` shim 捕获。
+  - 不再覆盖 Programs 根目录 `Ubuntu.lnk` / `Ubuntu-22.04.lnk`；只保留 `vibe-bridge` 子目录里的显式 captured WSL shortcut，并恢复旧 direct shortcut backup。
+
+### 验证
+
+- `cargo fmt --package vb-daemon --package vb-transport`
+- `cargo test -p vb-daemon`：38 lib + 18 main passed。
+- `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：passed。
+- `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：passed。
+- `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：passed。
+
+### 未完成
+
+- 新 `VibeBridgeSetup.exe` 尚未重建。本 WSL 环境缺 `x86_64-w64-mingw32-gcc`，也没有可调用的 `powershell.exe` / `cargo.exe`；当前 `D_deliverables/windows/VibeBridgeSetup.exe` 仍是旧包，不能用于验证本轮 host 修正。
+- 未在 native Windows install/repair 实测新版安装行为。
+
+### 下一步
+
+1. 在 native Windows、未被 vibe-bridge 捕获的 PowerShell 中运行：
+   ```powershell
+   cd C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge
+   .\T_tools\build_windows_product.ps1
+   .\D_deliverables\windows\VibeBridgeSetup.exe
+   ```
+2. 安装/修复后必须新开终端；旧窗口不会刷新 PATH/profile。
+3. 验证 direct Ubuntu -> `codex`、Windows Terminal 中 `wsl` -> `codex` 都只出现一个板端 session，Windows 终端自身能正常回滚，样式接近原生。
+4. 板端替换/重启和上板验证步骤不要写在本文件维护，见 `/home/rv_nano/AIKB/HANDOFF.md`。
+
+### 不要重复的坑
+
+- 不要把旧 `D_deliverables/windows/VibeBridgeSetup.exe` 当新包测。
+- 不要重新默认 wrapper Windows Terminal profiles；这会和“原生态终端样式/回滚”目标冲突。
+- 不要覆盖 `~/.local/bin/codex` / `~/.local/bin/claude`。
+- 不要把板端 LCD/HID/rootfs 同步细节继续写进上位机 handoff；它们归 `/home/rv_nano/AIKB/HANDOFF.md`。
+
+## 2026-05-26 上位机收尾体验修正：native WSL 入口
+
+用户最新实测：直接打开 Ubuntu 后运行 `codex` 的捕获效果已经可用；上位机剩余问题集中在：
+
+- 在 Windows 终端里先输入 `wsl` 再输入 `codex`，host 终端回滚/样式仍不像原生，怀疑安装包或策略未更新。
+- 板端确认键和 scrollback 已拆到 `/home/rv_nano/AIKB/HANDOFF.md` 维护。
+
+本轮判断：
+
+- `wsl -> codex` 不应继续靠双层 ConPTY/transient shim 硬补。普通 `wsl` 应保持 native passthrough，进入 WSL 后由 shell-integration 的 `codex`/`claude` shim 捕获 TUI；产品安装/修复也应恢复原生 Windows Terminal profile 和原始 Ubuntu 直达快捷方式。
+
+已改 host：
+
+- `crates/vb-daemon/src/main.rs`
+  - `install-product` 默认从 `--terminal-profiles` 改为 `--no-terminal-profiles`。
+  - 安装/修复在未启用 `--terminal-profiles` 时会调用 `uninstall_windows_terminal_profiles()`，把旧 `terminal-shim` 包装恢复成原始 commandline。
+  - `%LOCALAPPDATA%\vibe-bridge\bin\wsl.cmd` 现在始终 passthrough 到 `wsl.exe`，不再因为处在 captured terminal 中就注入 transient WSL shell。
+  - `install_wsl_start_menu_shortcuts()` 不再覆盖 Programs 根目录的 `Ubuntu.lnk` / `Ubuntu-22.04.lnk`；会先尝试恢复之前 `.vibe-bridge-backup` 的原始直达快捷方式，只保留 `vibe-bridge` 子目录里的显式 captured WSL shortcut。
+  - 新增单测 `product_install_keeps_native_terminal_profiles_by_default`、`wsl_cmd_shim_uses_native_passthrough`。
+- `T_tools/build_windows_product.ps1`
+  - 末尾提示改为 “installs WSL shell hooks and restores native Windows Terminal profiles by default”，不再写 “wraps Windows Terminal profiles”。
+
+已验证：
+
+- `cargo fmt --package vb-daemon --package vb-transport`
+- `cargo test -p vb-daemon`：38 个 lib 测试 + 18 个 main 测试通过。
+- `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过，无 warning。
+- `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+- `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：通过。
+
+未完成/风险：
+
+- WSL 本机缺少 `x86_64-w64-mingw32-gcc`，且没有 `pwsh` / `powershell.exe` / `cargo.exe` 可从 WSL 调 Windows 构建；因此新的 `D_deliverables/windows/VibeBridgeSetup.exe` 还没有重建。当前目录里的 setup exe 仍是旧产物，不能拿它验证本轮 host 修正。
+- 板端未验证项见 `/home/rv_nano/AIKB/HANDOFF.md`。
+
+下一步：
+
+1. 在 native Windows、未被 vibe-bridge 捕获的 PowerShell 中运行：
+   `cd C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge`
+   `.\T_tools\build_windows_product.ps1`
+2. 重新运行新生成的 `D_deliverables\windows\VibeBridgeSetup.exe` 做 install/repair。
+3. 安装后新开 Windows Terminal/Ubuntu；旧窗口不会刷新 PATH 和 profile。
+4. 验证 `wsl -> codex` 时，Windows 终端应保持 native WSL 样式/回滚，板端由 WSL shell-integration 捕获 Codex session。
+5. 板端替换/重启和上板验证步骤见 `/home/rv_nano/AIKB/HANDOFF.md`。
+
+## 2026-05-25 产品化安装器收尾：单 exe 安装、后台常驻、可卸载
+
+当前用户确认板端 AKIM、terminal 滚动、烧录基本都已做完，剩余目标转为“成品产品样式”：像 `Serein/Typora` 那样用户只需要拿到一个 Windows `.exe`，安装后后台常驻，不想要时能卸载，并且不破坏普通 `codex` / `claude` / Windows Terminal 使用习惯。
+
+本轮只改 host 产品安装层，没有改板端、HID 协议、terminal parser、AKIM、rootfs 或镜像。
+
+已改：
+
+- `crates/vb-daemon/src/main.rs`
+  - 新增 `install-product` / `setup` 命令：复用现有 `install-windows`，但产品默认打开 `--terminal-profiles` 和 `--management-shortcuts`。
+  - 新增 `uninstall-product` 命令：复用现有卸载逻辑，停止后台 daemon、删除 shims/versioned exe、还原 Windows Terminal profile。
+  - 新增 `status-windows`：打印安装目录、Startup 脚本、shim 状态、daemon TCP 可达性、status/log 路径。
+  - 支持把 release `vb-daemon.exe` 重命名为 `VibeBridgeSetup.exe` 后无参数运行即安装；文件名包含 `Uninstall` 时无参数运行即卸载。
+  - setup/uninstall 无参数路径失败时会等待 Enter，成功时自动退出，避免普通用户误以为卡住。
+  - 安装/卸载关键阶段新增即时进度输出并 flush，避免双击后长时间黑屏无反馈。
+  - `install-windows` 仍保持开发默认语义，不默认改 Terminal profile、不默认创建管理快捷方式；只有 `install-product` 打开产品默认。
+  - 产品安装会创建 Start Menu 管理入口：Install or Repair / Status / Uninstall。
+  - 2026-05-25 追加修正：用户双击 `VibeBridgeSetup.exe` 时没接板端，安装器提示 `daemon not confirmed running`，根因是 `serve-hid auto` 在绑定 TCP 前强制要求立即找到 HID。已改为无板也启动 TCP daemon，日志只提示 `auto (waiting for Vibe HID 359f:2120)`。
+  - 2026-05-25 追加修正：安装时写入 `%LOCALAPPDATA%\vibe-bridge\bin\wsl.cmd`。普通 Windows 终端中新开后直接输入交互式 `wsl` / `wsl -d Ubuntu-22.04` 会转入 captured Terminal + transient WSL shim；`wsl -l -v` 等非交互命令仍直通 `wsl.exe`。
+  - 2026-05-26 追加修正：`install_wsl_start_menu_shortcuts()` 不再只创建 `vibe-bridge` 子菜单里的 `Ubuntu (vibe-bridge).lnk`，还会在开始菜单 Programs 根目录写入同名 `Ubuntu.lnk` / `Ubuntu-22.04.lnk` direct shortcut，目标为 `terminal-shim -> wsl.exe -d <distro>`。如果同名用户快捷方式已存在，会先备份为 `.vibe-bridge-backup`，卸载时恢复；如果是我们自己的 direct shortcut，卸载时删除。
+  - 2026-05-26 追加修正：产品安装默认增加 `--wsl-shell`。它在每个 WSL distro 内安装 `~/.local/share/vibe-bridge/shell-integration/bin/{codex,claude}`，并向 `~/.bashrc`、`.profile`、已有 `.bash_profile` / `.bash_login` / `.zshrc` 写入带 marker 的 PATH block。这个不是旧事故 wrapper：不覆盖 `~/.local/bin/codex` / `claude`，不移动真实 CLI，不写 `real-bin`。shell shim 会用 WSL 内 `script(1)` 创建 PTY，自己发送 `agent.register` 和 `terminal.stream` 到 Windows daemon，因此原始 Ubuntu AppX、旧固定磁贴、任意 WSL shell 中运行 `codex` / `claude` 也能接入。卸载时移除 marker block 和 shell-integration 目录。
+  - 2026-05-26 追加修正：用户实测直接打开 Ubuntu 后 `PATH` 为 `~/.local/bin` 在 shell-integration 前，`which codex` 仍命中真实 CLI。根因是 Ubuntu login shell 的 `.profile` 会先 source `.bashrc`，再把 `~/.local/bin` 前置。安装脚本现在重装时先移除旧 marker block，再写入会“去重并强制把 shell-integration 放到 PATH 第一位”的 block，并覆盖 `.profile` 这类 login rc。
+  - 2026-05-26 追加修正：用户实测 `which codex` 已命中 shell-integration shim，但运行 `codex` 首屏卡住，按 `Ctrl+C` 后才吐出 Codex UI 和终端 query response 转义串。根因是 shim 的 `stream_loop` 用 `read -N 4096`，会等满 4096 字节或 EOF 才转发，交互式 TUI 首屏被缓冲。已改为 `read -t 0.03 -N 4096`，超时也刷出已有字节，避免 UI/终端响应延迟；同时把 `/dev/tcp` 连接失败重定向包进 block，避免 daemon 未就绪时污染用户终端。
+  - 2026-05-26 追加修正：用户反馈“直接打开 Ubuntu 的效果比通过 wsl 进入更好”。根因是 captured WSL 入口会先命中 `/tmp/vibe-bridge-shims-*` transient shim，仍走“外层 Terminal stream + 内层 agent 镜像”的旧策略。现在 transient shim 如果发现已安装 `~/.local/share/vibe-bridge/shell-integration/bin/{codex,claude}`，会直接 `exec` 过去，让 captured WSL 和原始 Ubuntu 使用同一条 WSL 内 PTY stream 策略；未安装 shell-integration 时仍保留旧 transient fallback。
+  - `status-windows` 现在也打印 `wsl shim` 是否存在。
+- `crates/vb-transport/src/windows.rs`
+  - `ReopenWinHidTransport` 新增 `open_lazy()`，允许 daemon 先启动监听，后续首次 HID 读写时再尝试打开/重连设备。
+- `crates/vb-daemon/src/lib.rs`
+  - 无 HID 时不再每秒重复打印相同 read error。
+  - HID 未连接时 heartbeat 线程不再继续追加 heartbeat，也不 flush outbox，避免无板后台常驻时日志和 outbox 膨胀；板子接入并建立 HID 连接后再恢复 flush。
+  - 2026-05-25 追加修正：`kind=terminal + fromLaunch=true` 的外层 Terminal 只作为 VT100 stream source，不再申请板端 `RequestSession`。内层 attached `codex` / `claude` 仍申请板端 sid，并继续接收父 Terminal 的 terminal.stream 镜像，避免一个 Codex 在板端出现两个 session。
+- `T_tools/build_windows_product.ps1`
+  - Windows 下构建 `cargo build -p vb-daemon --release`，并把 release `vb-daemon.exe` 复制为 `D_deliverables\windows\VibeBridgeSetup.exe`。
+  - 2026-05-25 追加修正：用户在 Windows 首次运行时 `target\release\vb-daemon.exe` 被后台进程占用，Cargo 删除旧 exe 失败 `os error 5`。脚本已改为设置 `CARGO_TARGET_DIR=D_deliverables\windows\build-target`，绕开仓库默认 `target\release` 锁文件，不通过强杀进程解决。
+  - 该 setup exe 是最终给用户运行的单文件安装/修复入口。
+
+已验证：
+
+- `cargo fmt --package vb-daemon`
+- `cargo test -p vb-daemon`：37 个 lib 测试 + 15 个 main 测试通过。
+- `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+- `git diff --check -- crates/vb-daemon/src/main.rs`：通过。
+- `rg -n "[ \t]+$" T_tools/build_windows_product.ps1`：无尾随空白。
+- 修正 Windows build target 后重跑 `cargo test -p vb-daemon`、`cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+- 修正无板安装和日志退避后重跑 `cargo fmt --package vb-daemon --package vb-transport`、`cargo test -p vb-daemon`、`cargo check -p vb-daemon --target x86_64-pc-windows-gnu`、`cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+- 修正 setup UX 后重跑 `cargo fmt --package vb-daemon`、`cargo test -p vb-daemon`、`cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+- 修正外层 Terminal 重复 session 和直接 `wsl` 捕获入口后重跑：
+  - `cargo fmt --package vb-daemon --package vb-transport`
+  - `cargo test -p vb-daemon`：38 个 lib 测试 + 16 个 main 测试通过。
+  - `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+  - `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+  - `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：通过。
+- 修正 direct Ubuntu 开始菜单入口后重跑：
+  - `cargo fmt --package vb-daemon --package vb-transport`
+  - `cargo test -p vb-daemon`：38 个 lib 测试 + 17 个 main 测试通过。
+  - `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+  - `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+  - `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：通过。
+- 新增 WSL shell integration 后重跑：
+  - `cargo fmt --package vb-daemon --package vb-transport`
+  - `cargo test -p vb-daemon`：38 个 lib 测试 + 18 个 main 测试通过。
+  - `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+  - `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+  - `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：通过。
+- 修正 WSL shell integration PATH 顺序后重跑：
+  - `cargo fmt --package vb-daemon --package vb-transport`
+  - `cargo test -p vb-daemon wsl_shell_integration_uses_pty_shims_without_replacing_cli`：通过。
+  - `cargo test -p vb-daemon`：38 个 lib 测试 + 18 个 main 测试通过。
+  - `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+  - `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+  - `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：通过。
+- 修正 WSL shell integration 首屏缓冲后重跑：
+  - `cargo fmt --package vb-daemon --package vb-transport`
+  - `cargo test -p vb-daemon wsl_shell_integration_uses_pty_shims_without_replacing_cli`：通过。
+- 修正 captured WSL transient shim 委派到 shell-integration 后重跑：
+  - `cargo fmt --package vb-daemon --package vb-transport`
+  - `cargo test -p vb-daemon wsl_terminal_profile_gets_transient_agent_shims`：通过。
+  - `cargo test -p vb-daemon`：38 个 lib 测试 + 18 个 main 测试通过。
+  - `cargo check -p vb-daemon --target x86_64-pc-windows-gnu`：通过。
+  - `cargo check -p vb-transport --target x86_64-pc-windows-gnu`：通过。
+  - `git diff --check -- crates/vb-daemon/src/main.rs crates/vb-daemon/src/lib.rs crates/vb-transport/src/windows.rs HANDOFF.md T_tools/build_windows_product.ps1`：通过。
+
+未验证：
+
+- 未在 native Windows 运行 `T_tools\build_windows_product.ps1` 生成真实 `VibeBridgeSetup.exe`。
+- 未在 Windows 双击 `VibeBridgeSetup.exe` 安装。
+- 未在 Windows 真机验证 WSL shell integration 下的原始 Ubuntu AppX / 旧固定磁贴 / 任意 WSL shell 中 `codex` 的 PTY 捕获效果。
+- 未做最终 host + 真板联测。
+- 未验证 Start Menu uninstall 能完整还原现场 Windows Terminal settings；代码路径已有单测覆盖 profile unwrap，但真实设置文件仍需用户实测。
+
+下一步建议：
+
+1. 在未被 vibe-bridge 捕获的 Windows PowerShell 中运行：
+   `cd C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge`
+   `.\T_tools\build_windows_product.ps1`
+2. 双击或运行生成的：
+   `D_deliverables\windows\VibeBridgeSetup.exe`
+3. 新开 Windows Terminal / Ubuntu profile，验证普通 shell 可用、`codex` / `claude` 可用、板端 SESSION 只看到内层 `codex` / `claude` sid，不再出现外层 `Terminal: Windows Power...` sid。
+4. 新开普通 PowerShell 或 Windows Terminal，运行 `wsl` 或 `wsl -d Ubuntu-22.04`，再在 WSL 内运行 `codex`，验证也能 hook 到板端。注意必须是安装后新开的终端，旧终端不会刷新 PATH。
+5. 从 Windows 开始菜单重新搜索并打开 `Ubuntu` / `Ubuntu-22.04`（安装后新生成的同名 direct shortcut），再运行 `codex`，验证也能 hook 到板端。若点击的是之前已经固定到任务栏/开始菜单的旧磁贴，可能仍指向原始 packaged app，需取消固定后从新搜索结果打开。
+6. 直接打开原始 Ubuntu AppX / 旧固定磁贴 / 任意 WSL shell，运行：
+   `echo $PATH | tr ':' '\n' | sed -n '1,5p'`
+   预期前几项包含 `~/.local/share/vibe-bridge/shell-integration/bin`。再运行 `which codex`，预期指向 shell-integration shim；运行 `codex` 后板端应出现单个 codex session。
+7. 用 Start Menu 的 `Vibe Bridge Status` 看 daemon 是否 listening，且 `wsl shim` 为 present。
+8. 最后用 Start Menu 的 `Uninstall Vibe Bridge` 验证还原，不要手工删除 `%LOCALAPPDATA%\vibe-bridge` 来代替卸载。
+
+路径约束：
+
+- 实际 Windows 项目目录是 `C:\Serein_Y\Sipeed\rv_nano\tools\vibe-bridge`。
+- agent 访问和修改代码时仍应使用 WSL 挂载路径 `/home/rv_nano/Sipeed/rv_nano/tools/vibe-bridge`，不要直接假设可访问 Windows 本地路径。
+
 ## 2026-05-24 ConPTY 尺寸收敛：优先修 host 端 producer/consumer 不一致
 
 用户按新诊断重新采集 `docs/logs.txt` 后，结论已经从“传输/FIFO 不明”推进到“VT100 producer 尺寸与板端 consumer 尺寸不一致”：
