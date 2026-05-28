@@ -7,6 +7,12 @@ const DEFAULT_LCD_COLS: i16 = 78;
 #[cfg(windows)]
 const DEFAULT_LCD_ROWS: i16 = 15;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductAction {
+    Install,
+    Uninstall,
+}
+
 fn main() {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -114,6 +120,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("install-product") | Some("setup") => {
+            let rest: Vec<String> = args.collect();
+            if let Err(err) = run_install_product(rest) {
+                eprintln!("install-product failed: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("uninstall-windows") => {
             let rest: Vec<String> = args.collect();
             if let Err(err) = run_uninstall_windows(rest) {
@@ -121,7 +134,36 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some("help") | Some("--help") | Some("-h") | None => print_help(),
+        Some("uninstall-product") => {
+            let rest: Vec<String> = args.collect();
+            if let Err(err) = run_uninstall_product(rest) {
+                eprintln!("uninstall-product failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("status-windows") => {
+            let rest: Vec<String> = args.collect();
+            if let Err(err) = run_status_windows(rest) {
+                eprintln!("status-windows failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("help") | Some("--help") | Some("-h") => print_help(),
+        None => {
+            if let Some(action) = product_action_from_current_exe_name() {
+                let result = match action {
+                    ProductAction::Install => run_install_product(Vec::new()),
+                    ProductAction::Uninstall => run_uninstall_product(Vec::new()),
+                };
+                if let Err(err) = result {
+                    eprintln!("{} failed: {err}", product_action_name(action));
+                    wait_for_enter_after_product_action();
+                    std::process::exit(1);
+                }
+            } else {
+                print_help();
+            }
+        }
         Some(other) => {
             eprintln!("unknown command: {other}");
             print_help();
@@ -161,16 +203,92 @@ fn print_help() {
     println!("  install-windows [--addr ADDR] [--device auto|PATH]");
     println!("                 [--wsl] [--wsl-distro NAME] [--no-startup]");
     println!("                 [--terminal-profiles] [--no-wsl-shortcuts]");
+    println!("                 [--wsl-shell] [--management-shortcuts]");
     println!("                 [--no-path] [--shim-dir DIR]");
     println!("                 (Windows only) install Startup daemon script and shims.");
+    println!("  install-product [same flags as install-windows]");
+    println!("                 (Windows only) product install: Startup daemon,");
+    println!("                 shims, Start Menu management, and WSL shell hooks.");
     println!("  uninstall-windows [--addr ADDR] [--shim-dir DIR]");
     println!("                 [--no-terminal-profiles] [--purge]");
     println!("                 (Windows only) stop background daemon and remove shims.");
+    println!("  uninstall-product [same flags as uninstall-windows]");
+    println!("                 (Windows only) product uninstall/restore.");
+    println!("  status-windows [--addr ADDR]");
+    println!("                 (Windows only) print install paths and daemon health.");
 }
 
 fn compact(value: &str) -> String {
     value.replace('\r', " ").replace('\n', " ")
 }
+
+#[cfg(windows)]
+fn product_step(label: &str) {
+    use std::io::Write;
+
+    println!("[vibe-bridge] {label}");
+    let _ = std::io::stdout().flush();
+}
+
+fn product_action_from_current_exe_name() -> Option<ProductAction> {
+    let exe = std::env::current_exe().ok()?;
+    let stem = exe.file_stem()?.to_string_lossy();
+    product_action_from_exe_name(&stem)
+}
+
+fn product_action_from_exe_name(name: &str) -> Option<ProductAction> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("uninstall") {
+        Some(ProductAction::Uninstall)
+    } else if lower.contains("setup") || lower.contains("installer") {
+        Some(ProductAction::Install)
+    } else {
+        None
+    }
+}
+
+fn product_action_name(action: ProductAction) -> &'static str {
+    match action {
+        ProductAction::Install => "install-product",
+        ProductAction::Uninstall => "uninstall-product",
+    }
+}
+
+fn product_install_args(mut raw: Vec<String>) -> Vec<String> {
+    let has_terminal_profile_choice = raw
+        .iter()
+        .any(|arg| arg == "--terminal-profiles" || arg == "--no-terminal-profiles");
+    if !has_terminal_profile_choice {
+        raw.push("--no-terminal-profiles".to_string());
+    }
+    let has_management_shortcut_choice = raw
+        .iter()
+        .any(|arg| arg == "--management-shortcuts" || arg == "--no-management-shortcuts");
+    if !has_management_shortcut_choice {
+        raw.push("--management-shortcuts".to_string());
+    }
+    let has_wsl_shell_choice = raw
+        .iter()
+        .any(|arg| arg == "--wsl-shell" || arg == "--no-wsl-shell");
+    if !has_wsl_shell_choice {
+        raw.push("--wsl-shell".to_string());
+    }
+    raw
+}
+
+#[cfg(windows)]
+fn wait_for_enter_after_product_action() {
+    if std::env::var_os("VIBE_BRIDGE_NO_PAUSE").is_some() {
+        return;
+    }
+    println!();
+    println!("Setup failed. Press Enter to close this window.");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
+#[cfg(not(windows))]
+fn wait_for_enter_after_product_action() {}
 
 #[cfg(windows)]
 fn run_serve_hid(addr: &str, device: &str) -> Result<(), String> {
@@ -180,15 +298,15 @@ fn run_serve_hid(addr: &str, device: &str) -> Result<(), String> {
     use vb_transport::{resolve_win_hid_device, ReopenWinHidTransport};
 
     if device == "auto" {
-        let path = resolve_win_hid_device()
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| "no Vibe HID 359f:2120 device found".to_string())?;
-        println!("vb-daemon HID: {path}");
+        match resolve_win_hid_device().map_err(|err| err.to_string())? {
+            Some(path) => println!("vb-daemon HID: {path}"),
+            None => eprintln!("vb-daemon HID: auto (waiting for Vibe HID 359f:2120)"),
+        }
     } else {
         println!("vb-daemon HID: {device}");
     }
     println!("vb-daemon registration ipc: tcp://{addr}");
-    let hid = Arc::new(ReopenWinHidTransport::open(device).map_err(|err| err.to_string())?);
+    let hid = Arc::new(ReopenWinHidTransport::open_lazy(device));
     run_tcp_hid_daemon(addr, hid)
 }
 
@@ -1625,6 +1743,11 @@ parent="${{VIBE_BRIDGE_TERMINAL_AGENT_ID:-}}"
 daemon="${{VIBE_BRIDGE_DAEMON:-127.0.0.1:8765}}"
 host="${{daemon%:*}}"
 port="${{daemon##*:}}"
+shell_integration="$HOME/.local/share/vibe-bridge/shell-integration/bin/$cmd"
+
+if [ -x "$shell_integration" ] && [ "$shell_integration" != "$0" ]; then
+  exec "$shell_integration" "$@"
+fi
 
 is_vibe_wrapper() {{
   [ -f "$1" ] && grep -q 'vibe-bridge WSL .*agent shim\|vibe-bridge WSL agent wrapper' "$1" 2>/dev/null
@@ -1650,7 +1773,7 @@ find_real() {{
 
 send_daemon() {{
   local json="$1"
-  if exec 9<>"/dev/tcp/$host/$port" 2>/dev/null; then
+  if {{ exec 9<>"/dev/tcp/$host/$port"; }} 2>/dev/null; then
     printf '%s\n' "$json" >&9 || true
     IFS= read -r _ <&9 || true
     exec 9>&- 9<&- || true
@@ -1734,9 +1857,11 @@ struct InstallWindowsOpts {
     shim_dir: std::path::PathBuf,
     wsl_distros: Vec<String>,
     install_wsl: bool,
+    install_wsl_shell: bool,
     install_startup: bool,
     install_terminal_profiles: bool,
     install_wsl_shortcuts: bool,
+    install_management_shortcuts: bool,
     update_path: bool,
 }
 
@@ -1759,19 +1884,24 @@ fn run_install_windows(raw: Vec<String>) -> Result<(), String> {
                 .to_string(),
         );
     }
+    product_step("starting Windows install or repair");
     let opts = parse_install_windows_args(raw)?;
     let source_exe = std::env::current_exe()
         .map_err(|err| format!("current_exe: {err}"))?
         .canonicalize()
         .map_err(|err| format!("canonicalize current exe: {err}"))?;
     let log_dir = local_appdata_dir()?.join("vibe-bridge");
+    product_step("preparing install directories");
     std::fs::create_dir_all(&opts.shim_dir)
         .map_err(|err| format!("create shim dir {}: {err}", opts.shim_dir.display()))?;
     std::fs::create_dir_all(&log_dir)
         .map_err(|err| format!("create log dir {}: {err}", log_dir.display()))?;
+    product_step("stopping previous background daemon if present");
     stop_background_daemon_processes_for_addr(&opts.addr)?;
+    product_step("copying versioned daemon executable");
     let exe = install_daemon_exe(&source_exe, &opts.shim_dir)?;
 
+    product_step("checking optional WSL integration");
     let selected_wsl_distros = resolve_wsl_distros(&opts)?;
     let default_wsl_distro = if opts.wsl_distros.len() == 1 {
         opts.wsl_distros.first().map(String::as_str)
@@ -1779,10 +1909,13 @@ fn run_install_windows(raw: Vec<String>) -> Result<(), String> {
         None
     };
 
+    product_step("writing codex, claude, and wsl command shims");
     write_agent_cmd(&opts.shim_dir, "codex", &exe, default_wsl_distro)?;
     write_agent_cmd(&opts.shim_dir, "claude", &exe, default_wsl_distro)?;
+    write_wsl_cmd(&opts.shim_dir, &exe)?;
 
     if opts.install_startup {
+        product_step("installing Startup background daemon entry");
         let startup_dir = startup_dir()?;
         std::fs::create_dir_all(&startup_dir)
             .map_err(|err| format!("create startup dir {}: {err}", startup_dir.display()))?;
@@ -1790,10 +1923,12 @@ fn run_install_windows(raw: Vec<String>) -> Result<(), String> {
     }
 
     if opts.update_path {
+        product_step("ensuring user PATH points to Vibe Bridge shims");
         ensure_user_path_contains(&opts.shim_dir)?;
     }
 
     let terminal_profile_summary = if opts.install_terminal_profiles {
+        product_step("wrapping Windows Terminal profiles");
         match install_windows_terminal_profiles(&exe, &opts.addr) {
             Ok(summary) => summary,
             Err(err) => {
@@ -1802,10 +1937,18 @@ fn run_install_windows(raw: Vec<String>) -> Result<(), String> {
             }
         }
     } else {
-        "skipped".to_string()
+        product_step("restoring native Windows Terminal profiles");
+        match uninstall_windows_terminal_profiles() {
+            Ok(summary) => format!("native ({summary})"),
+            Err(err) => {
+                eprintln!("warning: Windows Terminal profile restore failed: {err}");
+                format!("native not confirmed ({err})")
+            }
+        }
     };
 
     let wsl_shortcut_summary = if opts.install_wsl_shortcuts {
+        product_step("creating WSL Start Menu shortcuts");
         match install_wsl_start_menu_shortcuts(&exe, &opts.addr) {
             Ok(summary) => summary,
             Err(err) => {
@@ -1817,14 +1960,47 @@ fn run_install_windows(raw: Vec<String>) -> Result<(), String> {
         "skipped".to_string()
     };
 
+    let mut installed_wsl_shell = Vec::new();
+    if opts.install_wsl_shell {
+        product_step("installing WSL shell integration");
+        match resolve_wsl_shell_distros(&opts) {
+            Ok(distros) => {
+                for distro in distros {
+                    match install_wsl_shell_integration(&distro, &opts.addr) {
+                        Ok(()) => installed_wsl_shell.push(distro),
+                        Err(err) => {
+                            eprintln!("warning: WSL shell integration {distro} failed: {err}")
+                        }
+                    }
+                }
+            }
+            Err(err) => eprintln!("warning: WSL shell distro enumeration failed: {err}"),
+        }
+    }
+
+    let management_shortcut_summary = if opts.install_management_shortcuts {
+        product_step("creating Vibe Bridge management shortcuts");
+        match install_management_start_menu_shortcuts(&exe, &opts.addr, &opts.device) {
+            Ok(summary) => summary,
+            Err(err) => {
+                eprintln!("warning: management shortcut install failed: {err}");
+                format!("not confirmed ({err})")
+            }
+        }
+    } else {
+        "skipped".to_string()
+    };
+
     let mut installed_wsl = Vec::new();
     for distro in &selected_wsl_distros {
+        product_step(&format!("installing optional WSL wrapper for {distro}"));
         match install_wsl_distro(distro, &exe, &opts.addr) {
             Ok(()) => installed_wsl.push(distro.clone()),
             Err(err) => eprintln!("warning: WSL distro {distro} install failed: {err}"),
         }
     }
 
+    product_step("starting background daemon");
     let daemon_now = match ensure_daemon_listening_with_exe(&opts.addr, &exe, &opts.device) {
         Ok(()) => "running".to_string(),
         Err(err) => {
@@ -1863,6 +2039,19 @@ fn run_install_windows(raw: Vec<String>) -> Result<(), String> {
     println!("terminal   : {terminal_profile_summary}");
     println!("wsl links  : {wsl_shortcut_summary}");
     println!(
+        "wsl shell  : {}",
+        if opts.install_wsl_shell {
+            if installed_wsl_shell.is_empty() {
+                "none".to_string()
+            } else {
+                installed_wsl_shell.join(", ")
+            }
+        } else {
+            "skipped".to_string()
+        }
+    );
+    println!("start menu : {management_shortcut_summary}");
+    println!(
         "user PATH  : {}",
         if opts.update_path {
             "shim dir ensured; open a new terminal to use it"
@@ -1878,6 +2067,10 @@ fn run_install_windows(_raw: Vec<String>) -> Result<(), String> {
     Err("install-windows is only implemented on native Windows".to_string())
 }
 
+fn run_install_product(raw: Vec<String>) -> Result<(), String> {
+    run_install_windows(product_install_args(raw))
+}
+
 #[cfg(windows)]
 fn run_uninstall_windows(raw: Vec<String>) -> Result<(), String> {
     if running_inside_captured_terminal()? {
@@ -1889,12 +2082,19 @@ fn run_uninstall_windows(raw: Vec<String>) -> Result<(), String> {
         );
     }
 
+    product_step("starting Windows uninstall");
     let opts = parse_uninstall_windows_args(raw)?;
+    product_step("stopping background daemon");
     stop_background_daemon_processes_for_addr(&opts.addr)?;
+    product_step("removing Startup entry and command shims");
     let startup_removed = remove_startup_cmd()?;
     let shim_removed = remove_agent_cmds(&opts.shim_dir)?;
+    product_step("removing WSL Start Menu shortcuts");
     let wsl_shortcuts_removed = remove_wsl_start_menu_shortcuts()?;
+    product_step("removing WSL shell integration");
+    let removed_wsl_shell = remove_wsl_shell_integrations(&opts.addr)?;
     let terminal_profile_summary = if opts.remove_terminal_profiles {
+        product_step("restoring Windows Terminal profiles");
         match uninstall_windows_terminal_profiles() {
             Ok(summary) => summary,
             Err(err) => {
@@ -1905,8 +2105,10 @@ fn run_uninstall_windows(raw: Vec<String>) -> Result<(), String> {
     } else {
         "skipped".to_string()
     };
+    product_step("removing installed daemon executables");
     let (exe_removed, exe_skipped) = cleanup_daemon_exes(&opts.shim_dir)?;
     if opts.purge {
+        product_step("purging local logs and status");
         purge_local_state()?;
     } else {
         remove_daemon_status_file();
@@ -1929,6 +2131,14 @@ fn run_uninstall_windows(raw: Vec<String>) -> Result<(), String> {
             "absent"
         }
     );
+    println!(
+        "wsl shell  : {}",
+        if removed_wsl_shell.is_empty() {
+            "absent".to_string()
+        } else {
+            removed_wsl_shell.join(", ")
+        }
+    );
     println!("daemon exe : removed {exe_removed}, skipped {exe_skipped}");
     println!("purge      : {}", if opts.purge { "yes" } else { "no" });
     Ok(())
@@ -1939,6 +2149,97 @@ fn run_uninstall_windows(_raw: Vec<String>) -> Result<(), String> {
     Err("uninstall-windows is only implemented on native Windows".to_string())
 }
 
+fn run_uninstall_product(raw: Vec<String>) -> Result<(), String> {
+    run_uninstall_windows(raw)
+}
+
+#[cfg(windows)]
+fn run_status_windows(raw: Vec<String>) -> Result<(), String> {
+    use std::net::TcpStream;
+
+    let addr = parse_status_windows_args(raw)?;
+    let local_appdata = local_appdata_dir()?;
+    let install_dir = local_appdata.join("vibe-bridge");
+    let shim_dir = install_dir.join("bin");
+    let startup_script = startup_dir()?.join("vibe-bridge-daemon.cmd");
+    let status_path = daemon_status_path()?;
+    let log_path = install_dir.join("vb-daemon.log");
+    let daemon_reachable = TcpStream::connect(&addr).is_ok();
+
+    println!("vibe-bridge Windows status");
+    println!("daemon addr : {addr}");
+    println!(
+        "daemon tcp  : {}",
+        if daemon_reachable {
+            "listening"
+        } else {
+            "not reachable"
+        }
+    );
+    println!("install dir : {}", install_dir.display());
+    println!(
+        "startup     : {}",
+        if startup_script.exists() {
+            startup_script.display().to_string()
+        } else {
+            "absent".to_string()
+        }
+    );
+    println!(
+        "codex shim  : {}",
+        if shim_dir.join("codex.cmd").exists() {
+            "present"
+        } else {
+            "absent"
+        }
+    );
+    println!(
+        "claude shim : {}",
+        if shim_dir.join("claude.cmd").exists() {
+            "present"
+        } else {
+            "absent"
+        }
+    );
+    println!(
+        "wsl shim    : {}",
+        if shim_dir.join("wsl.cmd").exists() {
+            "present"
+        } else {
+            "absent"
+        }
+    );
+    println!("status file : {}", status_path.display());
+    if let Ok(status) = std::fs::read_to_string(&status_path) {
+        for line in status.lines().take(12) {
+            println!("  {line}");
+        }
+    } else {
+        println!("  absent");
+    }
+    println!("log file    : {}", log_path.display());
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_status_windows(_raw: Vec<String>) -> Result<(), String> {
+    Err("status-windows is only implemented on native Windows".to_string())
+}
+
+#[cfg(windows)]
+fn parse_status_windows_args(raw: Vec<String>) -> Result<String, String> {
+    let mut addr = "127.0.0.1:8765".to_string();
+    let mut iter = raw.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--addr" => addr = iter.next().ok_or("--addr needs ADDR")?,
+            "-h" | "--help" => return Err("usage: status-windows [--addr ADDR]".to_string()),
+            other => return Err(format!("unknown status-windows flag: {other}")),
+        }
+    }
+    Ok(addr)
+}
+
 #[cfg(windows)]
 fn parse_install_windows_args(raw: Vec<String>) -> Result<InstallWindowsOpts, String> {
     let mut opts = InstallWindowsOpts {
@@ -1947,9 +2248,11 @@ fn parse_install_windows_args(raw: Vec<String>) -> Result<InstallWindowsOpts, St
         shim_dir: local_appdata_dir()?.join("vibe-bridge").join("bin"),
         wsl_distros: Vec::new(),
         install_wsl: false,
+        install_wsl_shell: false,
         install_startup: true,
         install_terminal_profiles: false,
         install_wsl_shortcuts: true,
+        install_management_shortcuts: false,
         update_path: true,
     };
     let mut iter = raw.into_iter();
@@ -1966,15 +2269,19 @@ fn parse_install_windows_args(raw: Vec<String>) -> Result<InstallWindowsOpts, St
                 opts.wsl_distros.push(iter.next().ok_or("--wsl-distro needs NAME")?)
             }
             "--no-wsl" => opts.install_wsl = false,
+            "--wsl-shell" => opts.install_wsl_shell = true,
+            "--no-wsl-shell" => opts.install_wsl_shell = false,
             "--no-startup" => opts.install_startup = false,
             "--terminal-profiles" => opts.install_terminal_profiles = true,
             "--no-terminal-profiles" => opts.install_terminal_profiles = false,
             "--wsl-shortcuts" => opts.install_wsl_shortcuts = true,
             "--no-wsl-shortcuts" => opts.install_wsl_shortcuts = false,
+            "--management-shortcuts" => opts.install_management_shortcuts = true,
+            "--no-management-shortcuts" => opts.install_management_shortcuts = false,
             "--no-path" => opts.update_path = false,
             "-h" | "--help" => {
                 return Err(
-                    "usage: install-windows [--addr ADDR] [--device auto|PATH] [--shim-dir DIR] [--wsl] [--wsl-distro NAME] [--terminal-profiles] [--no-wsl-shortcuts] [--no-startup] [--no-path]"
+                    "usage: install-windows [--addr ADDR] [--device auto|PATH] [--shim-dir DIR] [--wsl] [--wsl-distro NAME] [--wsl-shell] [--terminal-profiles] [--management-shortcuts] [--no-wsl-shortcuts] [--no-startup] [--no-path]"
                         .to_string(),
                 )
             }
@@ -2272,6 +2579,19 @@ fn write_agent_cmd(
 }
 
 #[cfg(windows)]
+fn write_wsl_cmd(shim_dir: &std::path::Path, exe: &std::path::Path) -> Result<(), String> {
+    let content = format!(
+        "@echo off\r\n\
+         setlocal\r\n\
+         \"{}\" wsl-shim %*\r\n\
+         exit /b %ERRORLEVEL%\r\n",
+        shell_display_path(exe)
+    );
+    let path = shim_dir.join("wsl.cmd");
+    std::fs::write(&path, content).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+#[cfg(windows)]
 fn write_startup_cmd(
     startup_dir: &std::path::Path,
     exe: &std::path::Path,
@@ -2308,6 +2628,11 @@ fn remove_startup_cmd() -> Result<bool, String> {
 
 #[cfg(windows)]
 fn wsl_start_menu_shortcuts_dir() -> Result<std::path::PathBuf, String> {
+    start_menu_shortcuts_dir()
+}
+
+#[cfg(windows)]
+fn start_menu_programs_dir() -> Result<std::path::PathBuf, String> {
     let appdata = std::env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| "APPDATA is not set".to_string())?;
@@ -2315,8 +2640,46 @@ fn wsl_start_menu_shortcuts_dir() -> Result<std::path::PathBuf, String> {
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
-        .join("Programs")
-        .join("vibe-bridge"))
+        .join("Programs"))
+}
+
+#[cfg(windows)]
+fn start_menu_shortcuts_dir() -> Result<std::path::PathBuf, String> {
+    Ok(start_menu_programs_dir()?.join("vibe-bridge"))
+}
+
+#[cfg(windows)]
+fn install_management_start_menu_shortcuts(
+    exe: &std::path::Path,
+    addr: &str,
+    device: &str,
+) -> Result<String, String> {
+    let dir = start_menu_shortcuts_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("create Start Menu shortcut dir {}: {err}", dir.display()))?;
+    write_windows_shortcut(
+        &dir.join("Install or Repair Vibe Bridge.lnk"),
+        exe,
+        &format!(
+            "install-product --addr {} --device {}",
+            quote_windows_arg(addr),
+            quote_windows_arg(device)
+        ),
+        "Install or repair Vibe Bridge background capture",
+    )?;
+    write_windows_shortcut(
+        &dir.join("Vibe Bridge Status.lnk"),
+        exe,
+        &format!("status-windows --addr {}", quote_windows_arg(addr)),
+        "Show Vibe Bridge background daemon status",
+    )?;
+    write_windows_shortcut(
+        &dir.join("Uninstall Vibe Bridge.lnk"),
+        exe,
+        &format!("uninstall-product --addr {}", quote_windows_arg(addr)),
+        "Uninstall Vibe Bridge and restore Terminal profiles",
+    )?;
+    Ok("installed 3 management shortcut(s)".to_string())
 }
 
 #[cfg(windows)]
@@ -2325,6 +2688,7 @@ fn install_wsl_start_menu_shortcuts(exe: &std::path::Path, addr: &str) -> Result
     if distros.is_empty() {
         return Ok("no WSL distros found".to_string());
     }
+    let restored_direct = restore_direct_wsl_start_menu_shortcuts()?;
     let dir = wsl_start_menu_shortcuts_dir()?;
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("create WSL shortcut dir {}: {err}", dir.display()))?;
@@ -2350,7 +2714,14 @@ fn install_wsl_start_menu_shortcuts(exe: &std::path::Path, addr: &str) -> Result
         installed.push(distro);
     }
     let (names, count) = limited_profile_name_list(installed);
-    Ok(format!("installed {count} Start Menu shortcut(s): {names}"))
+    let restore_note = if restored_direct {
+        "; restored direct Ubuntu/WSL shortcut(s)"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "installed {count} Start Menu shortcut(s): {names}{restore_note}"
+    ))
 }
 
 #[cfg(windows)]
@@ -2394,13 +2765,96 @@ fn write_windows_shortcut(
 }
 
 #[cfg(windows)]
+fn shortcut_is_vibe_bridge(path: &std::path::Path) -> bool {
+    read_windows_shortcut(path)
+        .map(|shortcut| shortcut_summary_is_vibe_bridge(&shortcut))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn read_windows_shortcut(path: &std::path::Path) -> Result<String, String> {
+    let script = format!(
+        "$shell = New-Object -ComObject WScript.Shell; \
+         $shortcut = $shell.CreateShortcut({}); \
+         Write-Output $shortcut.TargetPath; \
+         Write-Output $shortcut.Arguments",
+        ps_quote(&shell_display_path(path))
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .map_err(|err| format!("run powershell to read shortcut: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "powershell shortcut read exited with {}; stderr={}",
+            output.status,
+            decode_windows_command_output(&output.stderr).trim()
+        ));
+    }
+    Ok(decode_windows_command_output(&output.stdout))
+}
+
+fn shortcut_summary_is_vibe_bridge(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    lower.contains("vibe-bridge") || lower.contains("terminal-shim")
+}
+
+#[cfg(windows)]
 fn remove_wsl_start_menu_shortcuts() -> Result<bool, String> {
+    let direct_changed = restore_direct_wsl_start_menu_shortcuts()?;
     let dir = wsl_start_menu_shortcuts_dir()?;
     if !dir.exists() {
-        return Ok(false);
+        return Ok(direct_changed);
     }
     std::fs::remove_dir_all(&dir).map_err(|err| format!("remove {}: {err}", dir.display()))?;
     Ok(true)
+}
+
+#[cfg(windows)]
+fn restore_direct_wsl_start_menu_shortcuts() -> Result<bool, String> {
+    let dir = start_menu_programs_dir()?;
+    let mut changed = false;
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|err| format!("read Start Menu programs dir {}: {err}", dir.display()))?
+        {
+            let entry = entry.map_err(|err| format!("read Start Menu entry: {err}"))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".lnk.vibe-bridge-backup") {
+                continue;
+            }
+            let original_name = name.trim_end_matches(".vibe-bridge-backup");
+            let original = path.with_file_name(original_name);
+            let _ = std::fs::remove_file(&original);
+            std::fs::rename(&path, &original).map_err(|err| {
+                format!(
+                    "restore Start Menu shortcut {} -> {}: {err}",
+                    path.display(),
+                    original.display()
+                )
+            })?;
+            changed = true;
+        }
+    }
+
+    for distro in list_wsl_distros().unwrap_or_default() {
+        let path = dir.join(format!("{}.lnk", sanitize_windows_shortcut_name(&distro)));
+        if path.exists() && shortcut_is_vibe_bridge(&path) {
+            std::fs::remove_file(&path)
+                .map_err(|err| format!("remove {}: {err}", path.display()))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(windows)]
@@ -2424,7 +2878,7 @@ fn sanitize_windows_shortcut_name(value: &str) -> String {
 #[cfg(windows)]
 fn remove_agent_cmds(shim_dir: &std::path::Path) -> Result<usize, String> {
     let mut removed = 0usize;
-    for name in ["codex.cmd", "claude.cmd"] {
+    for name in ["codex.cmd", "claude.cmd", "wsl.cmd"] {
         let path = shim_dir.join(name);
         if !path.exists() {
             continue;
@@ -2983,6 +3437,14 @@ fn resolve_wsl_distros(opts: &InstallWindowsOpts) -> Result<Vec<String>, String>
 }
 
 #[cfg(windows)]
+fn resolve_wsl_shell_distros(opts: &InstallWindowsOpts) -> Result<Vec<String>, String> {
+    if !opts.wsl_distros.is_empty() {
+        return Ok(opts.wsl_distros.clone());
+    }
+    list_wsl_distros()
+}
+
+#[cfg(windows)]
 fn list_wsl_distros() -> Result<Vec<String>, String> {
     let output = std::process::Command::new("wsl.exe")
         .args(["-l", "-q"])
@@ -3034,6 +3496,238 @@ fn install_wsl_distro(
     let hook_js = include_str!("../../../adapters/claude-code-hook/index.js");
     let script = build_wsl_install_script(distro, daemon_exe, addr, hook_js);
     run_wsl_script(distro, &script)
+}
+
+#[cfg(windows)]
+fn install_wsl_shell_integration(distro: &str, addr: &str) -> Result<(), String> {
+    let script = build_wsl_shell_integration_script(addr);
+    run_wsl_script(distro, &script)
+}
+
+#[cfg(windows)]
+fn remove_wsl_shell_integrations(addr: &str) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
+    for distro in list_wsl_distros()? {
+        let script = build_wsl_shell_uninstall_script(addr);
+        match run_wsl_script(&distro, &script) {
+            Ok(()) => removed.push(distro),
+            Err(err) => {
+                eprintln!("warning: WSL shell integration uninstall {distro} failed: {err}")
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn build_wsl_shell_integration_script(addr: &str) -> String {
+    format!(
+        r#"set -eu
+VB_ADDR={addr}
+VB_DIR="$HOME/.local/share/vibe-bridge/shell-integration"
+SHIM_DIR="$VB_DIR/bin"
+mkdir -p "$SHIM_DIR"
+
+cat > "$SHIM_DIR/codex" <<'WRAP'
+#!/usr/bin/env bash
+# vibe-bridge WSL shell integration agent shim
+set -u
+cmd="$(basename "$0")"
+shim_dir="${{VIBE_BRIDGE_WSL_SHELL_SHIM_DIR:-$HOME/.local/share/vibe-bridge/shell-integration/bin}}"
+daemon="${{VIBE_BRIDGE_DAEMON:-127.0.0.1:8765}}"
+host="${{daemon%:*}}"
+port="${{daemon##*:}}"
+agent_id="wsl-${{cmd}}-$$"
+cwd="$(pwd 2>/dev/null || true)"
+
+is_vibe_wrapper() {{
+  [ -f "$1" ] && grep -q 'vibe-bridge WSL .*agent shim\|vibe-bridge WSL agent wrapper\|vibe-bridge WSL shell integration agent shim' "$1" 2>/dev/null
+}}
+
+find_real() {{
+  local old_ifs="$IFS"
+  local dir candidate
+  IFS=:
+  for dir in $PATH; do
+    [ -n "$dir" ] || dir=.
+    [ "$dir" = "$shim_dir" ] && continue
+    candidate="$dir/$cmd"
+    if [ -x "$candidate" ] && ! is_vibe_wrapper "$candidate"; then
+      printf '%s\n' "$candidate"
+      IFS="$old_ifs"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+  for candidate in "$HOME/.local/bin/$cmd" "/usr/local/bin/$cmd" "/usr/bin/$cmd"; do
+    if [ -x "$candidate" ] && ! is_vibe_wrapper "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}}
+
+json_escape() {{
+  local s="$1"
+  s="${{s//\\/\\\\}}"
+  s="${{s//\"/\\\"}}"
+  s="${{s//$'\r'/ }}"
+  s="${{s//$'\n'/ }}"
+  printf '%s' "$s"
+}}
+
+send_daemon() {{
+  local json="$1"
+  if {{ exec 9<>"/dev/tcp/$host/$port"; }} 2>/dev/null; then
+    printf '%s\n' "$json" >&9 || true
+    IFS= read -r _ <&9 || true
+    exec 9>&- 9<&- || true
+  fi
+}}
+
+register_agent() {{
+  local cwd_json
+  cwd_json="$(json_escape "$cwd")"
+  send_daemon "$(printf '{{"type":"agent.register","agent":{{"agentId":"%s","kind":"%s","name":"%s","cwd":"%s","fromLaunch":true}}}}' "$agent_id" "$cmd" "$cmd" "$cwd_json")"
+}}
+
+abort_agent() {{
+  send_daemon "$(printf '{{"type":"session.abort","abort":{{"agentId":"%s","kind":"%s"}}}}' "$agent_id" "$cmd")"
+}}
+
+stream_chunk() {{
+  local chunk="$1"
+  local hex
+  hex="$(printf '%s' "$chunk" | od -An -tx1 -v | tr -d ' \n')"
+  [ -n "$hex" ] || return 0
+  send_daemon "$(printf '{{"type":"terminal.stream","stream":{{"agentId":"%s","kind":"%s","dataHex":"%s"}}}}' "$agent_id" "$cmd" "$hex")"
+}}
+
+real="$(find_real || true)"
+if [ -z "$real" ]; then
+  echo "vibe-bridge: real $cmd not found in WSL PATH" >&2
+  exit 127
+fi
+
+if ! command -v script >/dev/null 2>&1; then
+  echo "vibe-bridge: util-linux script(1) not found; running $cmd without terminal capture" >&2
+  exec "$real" "$@"
+fi
+
+register_agent
+tmp="${{TMPDIR:-/tmp}}/vibe-bridge-wsl-pty-${{cmd}}-$$"
+fifo="$tmp/out"
+mkdir -p "$tmp"
+mkfifo "$fifo"
+
+stream_loop() {{
+  local chunk status
+  while true; do
+    chunk=""
+    IFS= read -r -t 0.03 -N 4096 chunk
+    status=$?
+    if [ -n "$chunk" ]; then
+      printf '%s' "$chunk"
+      stream_chunk "$chunk"
+    fi
+    [ "$status" -eq 142 ] && continue
+    [ "$status" -eq 0 ] && continue
+    break
+  done < "$fifo"
+}}
+
+stream_loop &
+stream_pid=$!
+cmdline=""
+printf -v cmdline '%q ' "$real" "$@"
+script -qfec "$cmdline" /dev/null > "$fifo"
+rc=$?
+wait "$stream_pid" 2>/dev/null || true
+rm -rf "$tmp"
+abort_agent
+exit "$rc"
+WRAP
+
+cp "$SHIM_DIR/codex" "$SHIM_DIR/claude"
+chmod +x "$SHIM_DIR/codex" "$SHIM_DIR/claude"
+
+install_rc_block() {{
+  rc="$1"
+  touch "$rc"
+  remove_rc_block "$rc"
+  cat >> "$rc" <<RC
+
+# >>> vibe-bridge WSL shell integration >>>
+export VIBE_BRIDGE_DAEMON="\${{VIBE_BRIDGE_DAEMON:-$VB_ADDR}}"
+export VIBE_BRIDGE_WSL_SHELL_SHIM_DIR="\$HOME/.local/share/vibe-bridge/shell-integration/bin"
+if [ -d "\$VIBE_BRIDGE_WSL_SHELL_SHIM_DIR" ]; then
+  _vb_old_ifs="\$IFS"
+  _vb_new_path=""
+  IFS=:
+  for _vb_dir in \$PATH; do
+    [ "\$_vb_dir" = "\$VIBE_BRIDGE_WSL_SHELL_SHIM_DIR" ] && continue
+    if [ -z "\$_vb_new_path" ]; then
+      _vb_new_path="\$_vb_dir"
+    else
+      _vb_new_path="\$_vb_new_path:\$_vb_dir"
+    fi
+  done
+  IFS="\$_vb_old_ifs"
+  if [ -n "\$_vb_new_path" ]; then
+    export PATH="\$VIBE_BRIDGE_WSL_SHELL_SHIM_DIR:\$_vb_new_path"
+  else
+    export PATH="\$VIBE_BRIDGE_WSL_SHELL_SHIM_DIR"
+  fi
+  unset _vb_old_ifs _vb_new_path _vb_dir
+fi
+# <<< vibe-bridge WSL shell integration <<<
+RC
+}}
+
+remove_rc_block() {{
+  rc="$1"
+  [ -f "$rc" ] || return 0
+  tmp="$rc.vibe-bridge-tmp.$$"
+  awk '
+    /# >>> vibe-bridge WSL shell integration >>>/ {{ skip=1; next }}
+    /# <<< vibe-bridge WSL shell integration <<</ {{ skip=0; next }}
+    skip != 1 {{ print }}
+  ' "$rc" > "$tmp"
+  mv "$tmp" "$rc"
+}}
+
+install_rc_block "$HOME/.bashrc"
+[ -e "$HOME/.profile" ] && install_rc_block "$HOME/.profile" || true
+[ -e "$HOME/.bash_profile" ] && install_rc_block "$HOME/.bash_profile" || true
+[ -e "$HOME/.bash_login" ] && install_rc_block "$HOME/.bash_login" || true
+[ -e "$HOME/.zshrc" ] && install_rc_block "$HOME/.zshrc" || true
+"#,
+        addr = sh_quote(addr),
+    )
+}
+
+fn build_wsl_shell_uninstall_script(_addr: &str) -> String {
+    r#"set -eu
+remove_rc_block() {
+  rc="$1"
+  [ -f "$rc" ] || return 0
+  tmp="$rc.vibe-bridge-tmp.$$"
+  awk '
+    /# >>> vibe-bridge WSL shell integration >>>/ { skip=1; next }
+    /# <<< vibe-bridge WSL shell integration <<</ { skip=0; next }
+    skip != 1 { print }
+  ' "$rc" > "$tmp"
+  mv "$tmp" "$rc"
+}
+
+remove_rc_block "$HOME/.bashrc"
+[ -e "$HOME/.profile" ] && remove_rc_block "$HOME/.profile" || true
+[ -e "$HOME/.bash_profile" ] && remove_rc_block "$HOME/.bash_profile" || true
+[ -e "$HOME/.bash_login" ] && remove_rc_block "$HOME/.bash_login" || true
+[ -e "$HOME/.zshrc" ] && remove_rc_block "$HOME/.zshrc" || true
+rm -rf "$HOME/.local/share/vibe-bridge/shell-integration"
+"#
+    .to_string()
 }
 
 #[cfg(windows)]
@@ -3356,6 +4050,7 @@ struct WslShimPlan {
     wrapped: bool,
 }
 
+#[cfg(test)]
 fn build_wsl_shim_command(raw: &[String], addr: &str, parent_agent_id: &str) -> WslShimPlan {
     let Some(interactive_args) = interactive_wsl_args(raw) else {
         let mut command = vec!["wsl.exe".to_string()];
@@ -3381,9 +4076,17 @@ fn build_wsl_shim_command(raw: &[String], addr: &str, parent_agent_id: &str) -> 
     }
 }
 
+fn build_wsl_passthrough_command(raw: &[String]) -> WslShimPlan {
+    let mut command = vec!["wsl.exe".to_string()];
+    command.extend(raw.iter().cloned());
+    WslShimPlan {
+        command,
+        wrapped: false,
+    }
+}
+
 #[cfg(windows)]
 fn run_wsl_shim(raw: Vec<String>) -> Result<u32, String> {
-    let addr = std::env::var("VIBE_BRIDGE_DAEMON").unwrap_or_else(|_| "127.0.0.1:8765".to_string());
     let parent_agent_id = std::env::var("VIBE_BRIDGE_TERMINAL_AGENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -3396,25 +4099,10 @@ fn run_wsl_shim(raw: Vec<String>) -> Result<u32, String> {
         terminal_shim_log_args(&raw)
     ));
 
-    let plan = if captured {
-        if let Some(parent_agent_id) = parent_agent_id.as_deref() {
-            build_wsl_shim_command(&raw, &addr, parent_agent_id)
-        } else {
-            let mut command = vec!["wsl.exe".to_string()];
-            command.extend(raw.iter().cloned());
-            WslShimPlan {
-                command,
-                wrapped: false,
-            }
-        }
-    } else {
-        let mut command = vec!["wsl.exe".to_string()];
-        command.extend(raw.iter().cloned());
-        WslShimPlan {
-            command,
-            wrapped: false,
-        }
-    };
+    append_terminal_shim_log(
+        "[wsl-shim] native passthrough; WSL shell integration owns codex/claude capture",
+    );
+    let plan = build_wsl_passthrough_command(&raw);
 
     append_terminal_shim_log(format!(
         "[wsl-shim] {} command={}",
@@ -3713,6 +4401,69 @@ mod tests {
     }
 
     #[test]
+    fn setup_exe_name_triggers_product_install() {
+        assert_eq!(
+            product_action_from_exe_name("VibeBridgeSetup"),
+            Some(ProductAction::Install)
+        );
+        assert_eq!(
+            product_action_from_exe_name("vibe-bridge-installer"),
+            Some(ProductAction::Install)
+        );
+        assert_eq!(
+            product_action_from_exe_name("VibeBridgeUninstall"),
+            Some(ProductAction::Uninstall)
+        );
+        assert_eq!(product_action_from_exe_name("vb-daemon"), None);
+    }
+
+    #[test]
+    fn product_install_keeps_native_terminal_profiles_by_default() {
+        assert_eq!(
+            product_install_args(Vec::new()),
+            vec![
+                "--no-terminal-profiles".to_string(),
+                "--management-shortcuts".to_string(),
+                "--wsl-shell".to_string()
+            ]
+        );
+        assert_eq!(
+            product_install_args(argv(&["--no-terminal-profiles"])),
+            argv(&[
+                "--no-terminal-profiles",
+                "--management-shortcuts",
+                "--wsl-shell"
+            ])
+        );
+        assert_eq!(
+            product_install_args(argv(&["--addr", "127.0.0.1:9999"])),
+            argv(&[
+                "--addr",
+                "127.0.0.1:9999",
+                "--no-terminal-profiles",
+                "--management-shortcuts",
+                "--wsl-shell"
+            ])
+        );
+        assert_eq!(
+            product_install_args(argv(&["--no-management-shortcuts"])),
+            argv(&[
+                "--no-management-shortcuts",
+                "--no-terminal-profiles",
+                "--wsl-shell"
+            ])
+        );
+        assert_eq!(
+            product_install_args(argv(&["--no-wsl-shell"])),
+            argv(&[
+                "--no-wsl-shell",
+                "--no-terminal-profiles",
+                "--management-shortcuts"
+            ])
+        );
+    }
+
+    #[test]
     fn strip_jsonc_comments_preserves_urls_inside_strings() {
         let input = r#"{
           // comment
@@ -3810,10 +4561,12 @@ mod tests {
         assert!(script.contains("make_shim claude"));
         assert!(script.contains("/tmp"));
         assert!(script.contains("$HOME/.bashrc"));
+        assert!(script.contains("$HOME/.local/share/vibe-bridge/shell-integration/bin/$cmd"));
+        assert!(script.contains("exec \"$shell_integration\" \"$@\""));
         assert!(script.contains("export PATH=\"$VIBE_BRIDGE_WSL_SHIM_DIR:$new_path\""));
         assert!(!script.contains("> \"$HOME/.bashrc\""));
         assert!(!script.contains(">> \"$HOME/.bashrc\""));
-        assert!(!script.contains(".local/bin"));
+        assert!(!script.contains("$HOME/.local/bin"));
     }
 
     #[test]
@@ -3859,6 +4612,59 @@ mod tests {
             build_wsl_shim_command(&argv(&["-l", "-v"]), "127.0.0.1:8765", "launch-42");
         assert!(!passthrough.wrapped);
         assert_eq!(passthrough.command, argv(&["wsl.exe", "-l", "-v"]));
+    }
+
+    #[test]
+    fn wsl_cmd_shim_uses_native_passthrough() {
+        let plan = build_wsl_passthrough_command(&argv(&["-d", "Ubuntu-22.04"]));
+        assert!(!plan.wrapped);
+        assert_eq!(plan.command, argv(&["wsl.exe", "-d", "Ubuntu-22.04"]));
+
+        let list = build_wsl_passthrough_command(&argv(&["-l", "-v"]));
+        assert!(!list.wrapped);
+        assert_eq!(list.command, argv(&["wsl.exe", "-l", "-v"]));
+    }
+
+    #[test]
+    fn shortcut_summary_detects_vibe_bridge_shortcuts() {
+        assert!(shortcut_summary_is_vibe_bridge(
+            r"C:\Users\me\AppData\Local\vibe-bridge\bin\vb-daemon.exe
+terminal-shim --daemon 127.0.0.1:8765"
+        ));
+        assert!(shortcut_summary_is_vibe_bridge(
+            r"C:\Users\me\AppData\Local\vibe-bridge\bin\vb-daemon.exe
+status-windows"
+        ));
+        assert!(!shortcut_summary_is_vibe_bridge(
+            r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\ubuntu.exe"
+        ));
+    }
+
+    #[test]
+    fn wsl_shell_integration_uses_pty_shims_without_replacing_cli() {
+        let script = build_wsl_shell_integration_script("127.0.0.1:8765");
+        assert!(script.contains("vibe-bridge WSL shell integration agent shim"));
+        assert!(script.contains("script -qfec"));
+        assert!(script.contains("terminal.stream"));
+        assert!(script.contains("agent.register"));
+        assert!(script.contains("VIBE_BRIDGE_WSL_SHELL_SHIM_DIR"));
+        assert!(script.contains("$HOME/.local/share/vibe-bridge/shell-integration/bin"));
+        assert!(script.contains("install_rc_block \"$HOME/.profile\""));
+        assert!(script.contains("remove_rc_block \"$rc\""));
+        assert!(script.contains("for _vb_dir in \\$PATH; do"));
+        assert!(script.contains("read -r -t 0.03 -N 4096 chunk"));
+        assert!(script.contains("[ \"$status\" -eq 142 ] && continue"));
+        assert!(script.contains("if { exec 9<>\"/dev/tcp/$host/$port\"; } 2>/dev/null; then"));
+        assert!(
+            script.contains("export PATH=\"\\$VIBE_BRIDGE_WSL_SHELL_SHIM_DIR:\\$_vb_new_path\"")
+        );
+        assert!(!script.contains("cat > \"$HOME/.local/bin"));
+        assert!(!script.contains("# vibe-bridge WSL agent wrapper"));
+
+        let uninstall = build_wsl_shell_uninstall_script("127.0.0.1:8765");
+        assert!(uninstall.contains("remove_rc_block \"$HOME/.bashrc\""));
+        assert!(uninstall.contains("remove_rc_block \"$HOME/.profile\""));
+        assert!(uninstall.contains("rm -rf \"$HOME/.local/share/vibe-bridge/shell-integration\""));
     }
 
     #[test]

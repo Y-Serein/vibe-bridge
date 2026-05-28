@@ -174,6 +174,12 @@ impl BridgeDaemon {
                     for msg in board_sync_messages(&agent) {
                         self.board_outbox.push_back(msg);
                     }
+                } else if is_transport_only_terminal(&agent) {
+                    eprintln!(
+                        "[board] suppress terminal session for {}/{}; terminal remains stream source",
+                        agent.kind.as_str(),
+                        agent.agent_id
+                    );
                 } else {
                     self.enqueue_board_session_request(&agent);
                 }
@@ -797,6 +803,10 @@ fn board_sync_messages(agent: &RegisteredAgent) -> Vec<HidMessage> {
     out
 }
 
+fn is_transport_only_terminal(agent: &RegisteredAgent) -> bool {
+    agent.kind == AgentKind::Terminal && agent.from_launch
+}
+
 fn meta_message_for_agent(agent: &RegisteredAgent) -> Option<HidMessage> {
     let sid = agent.board_sid?.raw();
     Some(HidMessage {
@@ -1254,21 +1264,29 @@ where
     {
         let daemon = Arc::clone(&daemon);
         let hid = Arc::clone(&hid);
-        thread::spawn(move || loop {
-            match hid.recv() {
-                Ok(msg) => {
-                    if let Ok(mut daemon) = daemon.lock() {
-                        if let Err(err) = daemon.handle_board_message(msg) {
-                            eprintln!("board message ignored: {err}");
-                        }
-                        if let Err(err) = flush_board_outbox(&mut daemon, hid.as_ref()) {
-                            eprintln!("board outbox flush failed: {err}");
+        thread::spawn(move || {
+            let mut last_read_error = String::new();
+            loop {
+                match hid.recv() {
+                    Ok(msg) => {
+                        last_read_error.clear();
+                        if let Ok(mut daemon) = daemon.lock() {
+                            if let Err(err) = daemon.handle_board_message(msg) {
+                                eprintln!("board message ignored: {err}");
+                            }
+                            if let Err(err) = flush_board_outbox(&mut daemon, hid.as_ref()) {
+                                eprintln!("board outbox flush failed: {err}");
+                            }
                         }
                     }
-                }
-                Err(err) => {
-                    eprintln!("HID read failed: {err}");
-                    thread::sleep(Duration::from_secs(1));
+                    Err(err) => {
+                        let message = err.to_string();
+                        if message != last_read_error {
+                            eprintln!("HID read failed: {message}");
+                            last_read_error = message;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
                 }
             }
         });
@@ -1279,6 +1297,9 @@ where
         let hid = Arc::clone(&hid);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(2));
+            if !hid.is_connected() {
+                continue;
+            }
             if let Ok(mut daemon) = daemon.lock() {
                 // Host-level heartbeat: broadcast sid lets the board distinguish
                 // "bridge daemon alive" from per-session liveness. Existing
@@ -1461,6 +1482,9 @@ fn is_disconnect_error(err: &std::io::Error) -> bool {
 }
 
 fn flush_board_outbox<T: HidTransport>(daemon: &mut BridgeDaemon, hid: &T) -> Result<(), String> {
+    if !hid.is_connected() {
+        return Ok(());
+    }
     while let Some(msg) = daemon.board_outbox.pop_front() {
         let frames = split_host_to_board(msg.cmd, msg.sid, &msg.payload);
         let frame_count = frames.len();
@@ -1650,11 +1674,31 @@ mod tests {
     }
 
     #[test]
+    fn launched_terminal_is_transport_only_and_does_not_request_board_session() {
+        let mut daemon = BridgeDaemon::new();
+        daemon
+            .handle_json_line(
+                r#"{"type":"agent.register","agent":{"agentId":"terminal-1","kind":"terminal","name":"PowerShell","cwd":"/work","fromLaunch":true}}"#,
+            )
+            .unwrap();
+
+        assert!(daemon.drain_board_outbox().is_empty());
+        assert!(daemon.pending_board_sessions.is_empty());
+        assert_eq!(
+            daemon
+                .get_agent(AgentKind::Terminal, "terminal-1")
+                .unwrap()
+                .board_sid,
+            None
+        );
+    }
+
+    #[test]
     fn session_response_reassigns_reused_sid_from_stale_agent() {
         let mut daemon = BridgeDaemon::new();
         daemon
             .handle_json_line(
-                r#"{"type":"agent.register","agent":{"agentId":"terminal-old","kind":"terminal","name":"PowerShell","cwd":"/work","fromLaunch":true}}"#,
+                r#"{"type":"agent.register","agent":{"agentId":"claude-old","kind":"claude","name":"Claude","cwd":"/work","fromLaunch":true}}"#,
             )
             .unwrap();
         daemon.drain_board_outbox();
@@ -1668,9 +1712,9 @@ mod tests {
         daemon.drain_board_outbox();
         daemon
             .registered
-            .get_mut(&(AgentKind::Terminal, "terminal-old".to_string()))
+            .get_mut(&(AgentKind::Claude, "claude-old".to_string()))
             .unwrap()
-            .append_terminal_bytes(b"old terminal bytes");
+            .append_terminal_bytes(b"old claude bytes");
 
         daemon
             .handle_json_line(
@@ -1694,9 +1738,9 @@ mod tests {
 
         assert_eq!(
             daemon
-                .get_agent(AgentKind::Terminal, "terminal-old")
-                .unwrap()
-                .board_sid,
+                .get_agent(AgentKind::Claude, "claude-old")
+                .map(|agent| agent.board_sid)
+                .flatten(),
             None
         );
         assert_eq!(
@@ -2244,13 +2288,6 @@ mod tests {
                 r#"{"type":"agent.register","agent":{"agentId":"terminal-1","kind":"terminal","name":"PowerShell","cwd":"/work","fromLaunch":true}}"#,
             )
             .unwrap();
-        daemon
-            .handle_board_message(HidMessage {
-                cmd: Cmd::SessionResponse,
-                sid: 5,
-                payload: vec![SessionStatusByte::Ok as u8],
-            })
-            .unwrap();
         let _ = daemon.drain_board_outbox();
 
         daemon
@@ -2299,14 +2336,7 @@ mod tests {
                 r#"{"type":"agent.register","agent":{"agentId":"terminal-1","kind":"terminal","name":"PowerShell","cwd":"/work","fromLaunch":true}}"#,
             )
             .unwrap();
-        daemon
-            .handle_board_message(HidMessage {
-                cmd: Cmd::SessionResponse,
-                sid: 5,
-                payload: vec![SessionStatusByte::Ok as u8],
-            })
-            .unwrap();
-        let _ = daemon.drain_board_outbox();
+        assert!(daemon.drain_board_outbox().is_empty());
 
         daemon
             .handle_json_line(
@@ -2354,14 +2384,7 @@ mod tests {
                 r#"{"type":"agent.register","agent":{"agentId":"terminal-1","kind":"terminal","name":"PowerShell","cwd":"/work","fromLaunch":true}}"#,
             )
             .unwrap();
-        daemon
-            .handle_board_message(HidMessage {
-                cmd: Cmd::SessionResponse,
-                sid: 5,
-                payload: vec![SessionStatusByte::Ok as u8],
-            })
-            .unwrap();
-        let _ = daemon.drain_board_outbox();
+        assert!(daemon.drain_board_outbox().is_empty());
 
         let payload = b"existing codex screen";
         let hex = hex_encode(payload);
@@ -2407,14 +2430,7 @@ mod tests {
                 r#"{"type":"agent.register","agent":{"agentId":"terminal-1","kind":"terminal","name":"PowerShell","cwd":"/work","fromLaunch":true}}"#,
             )
             .unwrap();
-        daemon
-            .handle_board_message(HidMessage {
-                cmd: Cmd::SessionResponse,
-                sid: 5,
-                payload: vec![SessionStatusByte::Ok as u8],
-            })
-            .unwrap();
-        let _ = daemon.drain_board_outbox();
+        assert!(daemon.drain_board_outbox().is_empty());
 
         daemon
             .handle_json_line(

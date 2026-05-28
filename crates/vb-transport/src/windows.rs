@@ -151,6 +151,13 @@ impl ReopenWinHidTransport {
         })
     }
 
+    pub fn open_lazy(device: &str) -> Self {
+        Self {
+            device: device.to_string(),
+            inner: Mutex::new(None),
+        }
+    }
+
     fn open_current(&self) -> Result<WinHidTransport, TransportError> {
         open_device(&self.device)
     }
