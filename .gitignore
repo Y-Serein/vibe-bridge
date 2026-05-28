@@ -23,3 +23,17 @@ venv/
 /HANDOFF.md
 docs/
 images/
+
+# Local context, reference captures, and generated deliverables.
+# Keep curated Markdown context and skills versioned explicitly; ignore
+# bulky/raw context materials that should not enter normal commits.
+/C_context/BOM/
+/C_context/docs/
+/C_context/images/
+/C_context/*.xls
+/C_context/*.xlsx
+/C_context/*.zip
+/C_context/*.log
+/C_context/logs.txt
+/D_deliverables/
+/R_raw/
